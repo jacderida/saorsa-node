@@ -32,7 +32,7 @@ path = "src/bin/saorsa-client/main.rs"
 
 [dependencies]
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.11.0"
+saorsa-core = "0.11.1"
 saorsa-pqc = "0.4.0"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -51,6 +51,7 @@ sha2 = "0.10"
 
 # Async runtime
 tokio = { version = "1.35", features = ["full", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 
 # CLI
