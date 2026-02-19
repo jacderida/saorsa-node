@@ -946,11 +946,11 @@ impl TestNetwork {
     /// Create an `AntProtocol` handler for a test node.
     ///
     /// Configures:
-    /// - Disk storage with verification enabled
+    /// - LMDB storage with verification enabled
     /// - Payment verification disabled (for testing without Anvil)
     /// - Quote generator with a test rewards address
     async fn create_ant_protocol(data_dir: &std::path::Path) -> Result<AntProtocol> {
-        // Create disk storage
+        // Create LMDB storage
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,

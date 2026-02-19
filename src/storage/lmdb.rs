@@ -12,7 +12,6 @@ use crate::error::{Error, Result};
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::task::spawn_blocking;
 use tracing::{debug, trace, warn};
 
@@ -79,8 +78,6 @@ pub struct LmdbStorage {
     config: LmdbStorageConfig,
     /// Operation statistics.
     stats: parking_lot::RwLock<StorageStats>,
-    /// Current number of chunks in the database.
-    current_chunks: AtomicU64,
 }
 
 impl LmdbStorage {
@@ -102,9 +99,12 @@ impl LmdbStorage {
 
         let env_dir_clone = env_dir.clone();
         let (env, db) = spawn_blocking(move || -> Result<(Env, Database<Bytes, Bytes>)> {
-            // SAFETY: We ensure the LMDB environment directory is unique per node
-            // instance via `root_dir`, so no two processes open the same env
-            // concurrently. The directory is created above and owned by this node.
+            // SAFETY: `EnvOpenOptions::open()` is unsafe because LMDB uses memory-mapped
+            // I/O and relies on OS file-locking to prevent corruption from concurrent
+            // access by multiple processes. We satisfy this by giving each node instance
+            // a unique `root_dir` (scoped by peer-ID hex prefix), ensuring no two
+            // processes open the same LMDB environment. Callers who manually configure
+            // `--root-dir` must not point multiple nodes at the same directory.
             let env = unsafe {
                 EnvOpenOptions::new()
                     .map_size(max_map_size)
@@ -127,28 +127,20 @@ impl LmdbStorage {
         .await
         .map_err(|e| Error::Storage(format!("LMDB init task failed: {e}")))??;
 
-        // Read existing entry count from env stats
-        let rtxn = env
-            .read_txn()
-            .map_err(|e| Error::Storage(format!("Failed to read LMDB stats: {e}")))?;
-        let stat = db
-            .stat(&rtxn)
-            .map_err(|e| Error::Storage(format!("Failed to get db stat: {e}")))?;
-        let existing_chunks = stat.entries as u64;
-        drop(rtxn);
-
-        debug!(
-            "Initialized LMDB storage at {:?} ({} existing chunks)",
-            env_dir, existing_chunks
-        );
-
-        Ok(Self {
+        let storage = Self {
             env,
             db,
             config,
             stats: parking_lot::RwLock::new(StorageStats::default()),
-            current_chunks: AtomicU64::new(existing_chunks),
-        })
+        };
+
+        debug!(
+            "Initialized LMDB storage at {:?} ({} existing chunks)",
+            env_dir,
+            storage.current_chunks()
+        );
+
+        Ok(storage)
     }
 
     /// Store a chunk.
@@ -176,67 +168,64 @@ impl LmdbStorage {
             )));
         }
 
-        // Check if already exists (fast mmap read)
+        // Fast-path duplicate check (read-only, no write lock needed).
+        // This is an optimistic hint — the authoritative check happens inside
+        // the write transaction below to prevent TOCTOU races.
         if self.exists(address) {
             trace!("Chunk {} already exists", hex::encode(address));
-            {
-                let mut stats = self.stats.write();
-                stats.duplicates += 1;
-            }
+            self.stats.write().duplicates += 1;
             return Ok(false);
-        }
-
-        // Enforce max_chunks capacity limit (0 = unlimited)
-        if self.config.max_chunks > 0 {
-            let max_chunks = self.config.max_chunks as u64;
-            if self
-                .current_chunks
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                    if current >= max_chunks {
-                        None
-                    } else {
-                        Some(current + 1)
-                    }
-                })
-                .is_err()
-            {
-                let current = self.current_chunks.load(Ordering::SeqCst);
-                return Err(Error::Storage(format!(
-                    "Storage capacity reached: {} chunks stored, max is {}",
-                    current, self.config.max_chunks
-                )));
-            }
         }
 
         let key = *address;
         let value = content.to_vec();
         let env = self.env.clone();
         let db = self.db;
+        let max_chunks = self.config.max_chunks;
 
-        let write_result = spawn_blocking(move || -> Result<()> {
+        // Existence check, capacity enforcement, and write all happen atomically
+        // inside a single write transaction. LMDB serializes write transactions,
+        // so there are no TOCTOU races or counter-drift issues.
+        let was_new = spawn_blocking(move || -> Result<bool> {
             let mut wtxn = env
                 .write_txn()
                 .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+
+            // Authoritative existence check inside the serialized write txn
+            if db
+                .get(&wtxn, &key)
+                .map_err(|e| Error::Storage(format!("Failed to check existence: {e}")))?
+                .is_some()
+            {
+                return Ok(false);
+            }
+
+            // Enforce capacity limit (0 = unlimited)
+            if max_chunks > 0 {
+                let current = db
+                    .stat(&wtxn)
+                    .map_err(|e| Error::Storage(format!("Failed to read db stats: {e}")))?
+                    .entries;
+                if current >= max_chunks {
+                    return Err(Error::Storage(format!(
+                        "Storage capacity reached: {current} chunks stored, max is {max_chunks}"
+                    )));
+                }
+            }
+
             db.put(&mut wtxn, &key, &value)
                 .map_err(|e| Error::Storage(format!("Failed to put chunk: {e}")))?;
             wtxn.commit()
                 .map_err(|e| Error::Storage(format!("Failed to commit put: {e}")))?;
-            Ok(())
+            Ok(true)
         })
         .await
-        .map_err(|e| Error::Storage(format!("LMDB put task failed: {e}")))?;
+        .map_err(|e| Error::Storage(format!("LMDB put task failed: {e}")))??;
 
-        if let Err(e) = write_result {
-            // Roll back the capacity reservation on failure
-            if self.config.max_chunks > 0 {
-                self.current_chunks.fetch_sub(1, Ordering::SeqCst);
-            }
-            return Err(e);
-        }
-
-        // Increment current_chunks for unlimited mode (already incremented above for limited)
-        if self.config.max_chunks == 0 {
-            self.current_chunks.fetch_add(1, Ordering::SeqCst);
+        if !was_new {
+            trace!("Chunk {} already exists", hex::encode(address));
+            self.stats.write().duplicates += 1;
+            return Ok(false);
         }
 
         {
@@ -362,7 +351,6 @@ impl LmdbStorage {
         .map_err(|e| Error::Storage(format!("LMDB delete task failed: {e}")))??;
 
         if deleted {
-            self.current_chunks.fetch_sub(1, Ordering::SeqCst);
             debug!("Deleted chunk {}", hex::encode(address));
         }
 
@@ -373,8 +361,19 @@ impl LmdbStorage {
     #[must_use]
     pub fn stats(&self) -> StorageStats {
         let mut stats = self.stats.read().clone();
-        stats.current_chunks = self.current_chunks.load(Ordering::SeqCst);
+        stats.current_chunks = self.current_chunks();
         stats
+    }
+
+    /// Return the number of chunks currently stored, queried from LMDB metadata.
+    ///
+    /// This is an O(1) read of the B-tree page header — not a full scan.
+    #[must_use]
+    pub fn current_chunks(&self) -> u64 {
+        let Ok(rtxn) = self.env.read_txn() else {
+            return 0;
+        };
+        self.db.stat(&rtxn).map(|s| s.entries as u64).unwrap_or(0)
     }
 
     /// Compute content address (SHA256 hash).
@@ -619,7 +618,7 @@ mod tests {
                 max_map_size: TEST_MAP_SIZE,
             };
             let storage = LmdbStorage::new(config).await.expect("reopen storage");
-            assert_eq!(storage.current_chunks.load(Ordering::SeqCst), 1);
+            assert_eq!(storage.current_chunks(), 1);
             let retrieved = storage.get(&address).await.expect("get");
             assert_eq!(retrieved, Some(content.to_vec()));
         }

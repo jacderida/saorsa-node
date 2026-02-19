@@ -30,14 +30,15 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! use std::sync::Arc;
 //! use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 //!
 //! // Create storage
 //! let config = LmdbStorageConfig::default();
-//! let storage = LmdbStorage::new(config).await?;
+//! let storage = Arc::new(LmdbStorage::new(config).await?);
 //!
 //! // Create protocol handler
-//! let protocol = AntProtocol::new(storage, payment_verifier, quote_generator);
+//! let protocol = AntProtocol::new(storage, Arc::new(payment_verifier), Arc::new(quote_generator));
 //!
 //! // Register with saorsa-core
 //! listener.register_protocol(protocol).await?;
