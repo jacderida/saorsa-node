@@ -418,7 +418,7 @@ const fn default_bootstrap_stale_days() -> u64 {
 
 /// Storage configuration for chunk persistence.
 ///
-/// Controls how chunks are stored on disk, including:
+/// Controls how chunks are stored, including:
 /// - Whether storage is enabled
 /// - Maximum chunks to store (for capacity management)
 /// - Content verification on read

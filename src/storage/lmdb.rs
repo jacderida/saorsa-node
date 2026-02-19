@@ -129,7 +129,7 @@ impl LmdbStorage {
         debug!(
             "Initialized LMDB storage at {:?} ({} existing chunks)",
             env_dir,
-            storage.current_chunks()
+            storage.current_chunks()?
         );
 
         Ok(storage)
@@ -163,7 +163,7 @@ impl LmdbStorage {
         // Fast-path duplicate check (read-only, no write lock needed).
         // This is an optimistic hint — the authoritative check happens inside
         // the write transaction below to prevent TOCTOU races.
-        if self.exists(address) {
+        if self.exists(address)? {
             trace!("Chunk {} already exists", hex::encode(address));
             self.stats.write().duplicates += 1;
             return Ok(false);
@@ -303,16 +303,21 @@ impl LmdbStorage {
     }
 
     /// Check if a chunk exists.
-    #[must_use]
-    pub fn exists(&self, address: &XorName) -> bool {
-        let Ok(rtxn) = self.env.read_txn() else {
-            return false;
-        };
-        self.db
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB read transaction fails.
+    pub fn exists(&self, address: &XorName) -> Result<bool> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+        let found = self
+            .db
             .get(&rtxn, address.as_ref())
-            .ok()
-            .flatten()
-            .is_some()
+            .map_err(|e| Error::Storage(format!("Failed to check existence: {e}")))?
+            .is_some();
+        Ok(found)
     }
 
     /// Delete a chunk.
@@ -350,19 +355,28 @@ impl LmdbStorage {
     #[must_use]
     pub fn stats(&self) -> StorageStats {
         let mut stats = self.stats.read().clone();
-        stats.current_chunks = self.current_chunks();
+        stats.current_chunks = self.current_chunks().unwrap_or(0);
         stats
     }
 
     /// Return the number of chunks currently stored, queried from LMDB metadata.
     ///
     /// This is an O(1) read of the B-tree page header — not a full scan.
-    #[must_use]
-    pub fn current_chunks(&self) -> u64 {
-        let Ok(rtxn) = self.env.read_txn() else {
-            return 0;
-        };
-        self.db.stat(&rtxn).map(|s| s.entries as u64).unwrap_or(0)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB read transaction fails.
+    pub fn current_chunks(&self) -> Result<u64> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+        let entries = self
+            .db
+            .stat(&rtxn)
+            .map_err(|e| Error::Storage(format!("Failed to read db stats: {e}")))?
+            .entries;
+        Ok(entries as u64)
     }
 
     /// Compute content address (SHA256 hash).
@@ -448,11 +462,11 @@ mod tests {
         let content = b"exists test";
         let address = LmdbStorage::compute_address(content);
 
-        assert!(!storage.exists(&address));
+        assert!(!storage.exists(&address).expect("exists"));
 
         storage.put(&address, content).await.expect("put");
 
-        assert!(storage.exists(&address));
+        assert!(storage.exists(&address).expect("exists"));
     }
 
     #[tokio::test]
@@ -464,12 +478,12 @@ mod tests {
 
         // Store
         storage.put(&address, content).await.expect("put");
-        assert!(storage.exists(&address));
+        assert!(storage.exists(&address).expect("exists"));
 
         // Delete
         let deleted = storage.delete(&address).await.expect("delete");
         assert!(deleted);
-        assert!(!storage.exists(&address));
+        assert!(!storage.exists(&address).expect("exists"));
 
         // Delete again (already deleted)
         let deleted2 = storage.delete(&address).await.expect("delete 2");
@@ -602,7 +616,7 @@ mod tests {
                 max_chunks: 0,
             };
             let storage = LmdbStorage::new(config).await.expect("reopen storage");
-            assert_eq!(storage.current_chunks(), 1);
+            assert_eq!(storage.current_chunks().expect("current_chunks"), 1);
             let retrieved = storage.get(&address).await.expect("get");
             assert_eq!(retrieved, Some(content.to_vec()));
         }
