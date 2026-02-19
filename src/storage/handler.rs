@@ -303,12 +303,10 @@ mod tests {
     use super::*;
     use crate::payment::metrics::QuotingMetricsTracker;
     use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
+    use crate::storage::lmdb::TEST_MAP_SIZE;
     use crate::storage::LmdbStorageConfig;
     use ant_evm::RewardsAddress;
     use tempfile::TempDir;
-
-    /// LMDB map size for tests: 10 MiB.
-    const TEST_MAP_SIZE: usize = 10 * 1024 * 1024;
 
     async fn create_test_protocol() -> (AntProtocol, TempDir) {
         let temp_dir = TempDir::new().expect("create temp dir");

@@ -18,9 +18,9 @@ use tracing::{debug, trace, warn};
 /// Default LMDB map size: 1 TiB virtual address space (costs nothing until used).
 const DEFAULT_MAX_MAP_SIZE: usize = 1_099_511_627_776;
 
-/// LMDB map size for tests: 10 MiB.
+/// LMDB map size for tests: 100 MiB.
 #[cfg(test)]
-const TEST_MAP_SIZE: usize = 10 * 1024 * 1024;
+pub(crate) const TEST_MAP_SIZE: usize = 100 * 1024 * 1024;
 
 /// Configuration for LMDB storage.
 #[derive(Debug, Clone)]
@@ -282,10 +282,7 @@ impl LmdbStorage {
         if self.config.verify_on_read {
             let computed = Self::compute_address(&content);
             if computed != *address {
-                {
-                    let mut stats = self.stats.write();
-                    stats.verification_failures += 1;
-                }
+                self.stats.write().verification_failures += 1;
                 warn!(
                     "Chunk verification failed: expected {}, computed {}",
                     hex::encode(address),
@@ -401,7 +398,7 @@ mod tests {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: true,
             max_chunks: 0,
-            max_map_size: TEST_MAP_SIZE, // 10 MiB for tests
+            max_map_size: TEST_MAP_SIZE,
         };
         let storage = LmdbStorage::new(config).await.expect("create storage");
         (storage, temp_dir)
