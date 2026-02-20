@@ -15,17 +15,10 @@ use std::path::{Path, PathBuf};
 use tokio::task::spawn_blocking;
 use tracing::{debug, trace, warn};
 
-/// Default LMDB map size.
+/// Default LMDB map size: 32 GiB.
 ///
-/// On Unix the mmap is a lazy virtual-address reservation — 1 TiB costs nothing
-/// until pages are faulted in. On Windows the mapping is backed by the paging
-/// file, so we use a conservative 1 GiB to avoid exhausting commit charge on CI
-/// runners and small VMs.
-#[cfg(not(target_os = "windows"))]
-const DEFAULT_MAX_MAP_SIZE: usize = 1_099_511_627_776; // 1 TiB
-
-#[cfg(target_os = "windows")]
-const DEFAULT_MAX_MAP_SIZE: usize = 1_073_741_824; // 1 GiB
+/// Node operators can override this via `storage.db_size_gb` in `config.toml`.
+const DEFAULT_MAX_MAP_SIZE: usize = 32 * 1_073_741_824; // 32 GiB
 
 /// Configuration for LMDB storage.
 #[derive(Debug, Clone)]
@@ -36,6 +29,8 @@ pub struct LmdbStorageConfig {
     pub verify_on_read: bool,
     /// Maximum number of chunks to store (0 = unlimited).
     pub max_chunks: usize,
+    /// Maximum LMDB map size in bytes (0 = use platform default).
+    pub max_map_size: usize,
 }
 
 impl Default for LmdbStorageConfig {
@@ -44,6 +39,7 @@ impl Default for LmdbStorageConfig {
             root_dir: PathBuf::from(".saorsa/chunks"),
             verify_on_read: true,
             max_chunks: 0,
+            max_map_size: 0,
         }
     }
 }
@@ -98,6 +94,12 @@ impl LmdbStorage {
         std::fs::create_dir_all(&env_dir)
             .map_err(|e| Error::Storage(format!("Failed to create LMDB directory: {e}")))?;
 
+        let map_size = if config.max_map_size > 0 {
+            config.max_map_size
+        } else {
+            DEFAULT_MAX_MAP_SIZE
+        };
+
         let env_dir_clone = env_dir.clone();
         let (env, db) = spawn_blocking(move || -> Result<(Env, Database<Bytes, Bytes>)> {
             // SAFETY: `EnvOpenOptions::open()` is unsafe because LMDB uses memory-mapped
@@ -108,7 +110,7 @@ impl LmdbStorage {
             // `--root-dir` must not point multiple nodes at the same directory.
             let env = unsafe {
                 EnvOpenOptions::new()
-                    .map_size(DEFAULT_MAX_MAP_SIZE)
+                    .map_size(map_size)
                     .max_dbs(1)
                     .open(&env_dir_clone)
                     .map_err(|e| Error::Storage(format!("Failed to open LMDB env: {e}")))?
@@ -413,6 +415,7 @@ mod tests {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: true,
             max_chunks: 0,
+            max_map_size: 0,
         };
         let storage = LmdbStorage::new(config).await.expect("create storage");
         (storage, temp_dir)
@@ -506,6 +509,7 @@ mod tests {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: true,
             max_chunks: 2,
+            max_map_size: 0,
         };
         let storage = LmdbStorage::new(config).await.expect("create storage");
 
@@ -582,6 +586,7 @@ mod tests {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: true,
             max_chunks: 1,
+            max_map_size: 0,
         };
         let storage = LmdbStorage::new(config).await.expect("create storage");
 
@@ -612,6 +617,7 @@ mod tests {
                 root_dir: temp_dir.path().to_path_buf(),
                 verify_on_read: true,
                 max_chunks: 0,
+                max_map_size: 0,
             };
             let storage = LmdbStorage::new(config).await.expect("create storage");
             storage.put(&address, content).await.expect("put");
@@ -623,6 +629,7 @@ mod tests {
                 root_dir: temp_dir.path().to_path_buf(),
                 verify_on_read: true,
                 max_chunks: 0,
+                max_map_size: 0,
             };
             let storage = LmdbStorage::new(config).await.expect("reopen storage");
             assert_eq!(storage.current_chunks().expect("current_chunks"), 1);
