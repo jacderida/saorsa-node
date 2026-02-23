@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 
+/// Filename for the persisted node identity keypair.
+pub const NODE_IDENTITY_FILENAME: &str = "node_identity.key";
+
+/// Subdirectory under the root dir that contains per-node data directories.
+pub const NODES_SUBDIR: &str = "nodes";
+
 /// IP version configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -325,11 +331,22 @@ fn default_github_repo() -> String {
     "dirvine/saorsa-node".to_string()
 }
 
-fn default_root_dir() -> PathBuf {
+/// Default base directory for node data (platform data dir for "saorsa").
+#[must_use]
+pub fn default_root_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "saorsa").map_or_else(
         || PathBuf::from(".saorsa"),
         |dirs| dirs.data_dir().to_path_buf(),
     )
+}
+
+/// Default directory containing per-node data subdirectories.
+///
+/// Each node gets `{default_root_dir}/nodes/{peer_id}/` where `peer_id` is the
+/// full 64-character hex-encoded node ID.
+#[must_use]
+pub fn default_nodes_dir() -> PathBuf {
+    default_root_dir().join(NODES_SUBDIR)
 }
 
 fn default_log_level() -> String {
@@ -407,7 +424,7 @@ const fn default_bootstrap_stale_days() -> u64 {
 
 /// Storage configuration for chunk persistence.
 ///
-/// Controls how chunks are stored on disk, including:
+/// Controls how chunks are stored, including:
 /// - Whether storage is enabled
 /// - Maximum chunks to store (for capacity management)
 /// - Content verification on read
@@ -427,6 +444,12 @@ pub struct StorageConfig {
     /// Default: true
     #[serde(default = "default_storage_verify_on_read")]
     pub verify_on_read: bool,
+
+    /// Maximum LMDB database size in GiB (0 = use default of 32 GiB).
+    /// On Unix the mmap is a lazy reservation and costs nothing until pages
+    /// are faulted in.
+    #[serde(default)]
+    pub db_size_gb: usize,
 }
 
 impl Default for StorageConfig {
@@ -435,6 +458,7 @@ impl Default for StorageConfig {
             enabled: default_storage_enabled(),
             max_chunks: 0,
             verify_on_read: default_storage_verify_on_read(),
+            db_size_gb: 0,
         }
     }
 }

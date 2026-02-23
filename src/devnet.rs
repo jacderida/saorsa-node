@@ -4,13 +4,15 @@
 //! multi-node networks on a single machine.
 
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
+use crate::config::{default_root_dir, NODES_SUBDIR, NODE_IDENTITY_FILENAME};
 use crate::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
-use crate::storage::{AntProtocol, DiskStorage, DiskStorageConfig};
+use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use ant_evm::RewardsAddress;
 use rand::Rng;
+use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -168,14 +170,11 @@ impl Default for DevnetConfig {
         let max_base_port = DEVNET_PORT_RANGE_MAX.saturating_sub(DEFAULT_NODE_COUNT as u16);
         let base_port = rng.gen_range(DEVNET_PORT_RANGE_MIN..max_base_port);
 
-        let suffix: u64 = rng.gen();
-        let data_dir = std::env::temp_dir().join(format!("saorsa_devnet_{suffix:x}"));
-
         Self {
             node_count: DEFAULT_NODE_COUNT,
             base_port,
             bootstrap_count: DEFAULT_BOOTSTRAP_COUNT,
-            data_dir,
+            data_dir: default_root_dir(),
             spawn_delay: Duration::from_millis(DEFAULT_SPAWN_DELAY_MS),
             stabilization_timeout: Duration::from_secs(DEFAULT_STABILIZATION_TIMEOUT_SECS),
             node_startup_timeout: Duration::from_secs(DEFAULT_NODE_STARTUP_TIMEOUT_SECS),
@@ -265,6 +264,7 @@ pub enum NodeState {
 pub struct DevnetNode {
     index: usize,
     node_id: String,
+    peer_id: String,
     port: u16,
     address: SocketAddr,
     data_dir: PathBuf,
@@ -492,16 +492,27 @@ impl Devnet {
             .map_err(|_| DevnetError::Config(format!("Node index {index} exceeds u16::MAX")))?;
         let port = self.config.base_port + index_u16;
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+        // Generate identity first so we can use peer_id as the directory name
+        let identity = NodeIdentity::generate()
+            .map_err(|e| DevnetError::Core(format!("Failed to generate node identity: {e}")))?;
+        let peer_id = hex::encode(identity.node_id().0);
         let node_id = format!("devnet_node_{index}");
-        let data_dir = self.config.data_dir.join(&node_id);
+        let data_dir = self.config.data_dir.join(NODES_SUBDIR).join(&peer_id);
 
         tokio::fs::create_dir_all(&data_dir).await?;
+
+        identity
+            .save_to_file(&data_dir.join(NODE_IDENTITY_FILENAME))
+            .await
+            .map_err(|e| DevnetError::Core(format!("Failed to save node identity: {e}")))?;
 
         let ant_protocol = Self::create_ant_protocol(&data_dir).await?;
 
         Ok(DevnetNode {
             index,
             node_id,
+            peer_id,
             port,
             address,
             data_dir,
@@ -515,14 +526,15 @@ impl Devnet {
     }
 
     async fn create_ant_protocol(data_dir: &std::path::Path) -> Result<AntProtocol> {
-        let storage_config = DiskStorageConfig {
+        let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
             max_chunks: 0,
+            max_map_size: 0,
         };
-        let storage = DiskStorage::new(storage_config)
+        let storage = LmdbStorage::new(storage_config)
             .await
-            .map_err(|e| DevnetError::Core(format!("Failed to create disk storage: {e}")))?;
+            .map_err(|e| DevnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
 
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
@@ -552,6 +564,7 @@ impl Devnet {
         let mut core_config = CoreNodeConfig::new()
             .map_err(|e| DevnetError::Core(format!("Failed to create core config: {e}")))?;
 
+        core_config.peer_id = Some(node.peer_id.clone());
         core_config.listen_addr = node.address;
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false;
