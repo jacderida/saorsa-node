@@ -6,7 +6,7 @@
 //! ## Data Model
 //!
 //! Chunks are the only data type supported:
-//! - **Content-addressed**: Address = SHA256(content)
+//! - **Content-addressed**: Address = BLAKE3(content)
 //! - **Immutable**: Once stored, content cannot change
 //! - **Paid**: Storage requires EVM payment on Arbitrum when a wallet is configured;
 //!   devnets with EVM disabled accept unpaid puts
@@ -77,7 +77,7 @@ impl Default for QuantumConfig {
 ///
 /// ## Chunk Storage Model
 ///
-/// Chunks are content-addressed: the address is the SHA256 hash of the content.
+/// Chunks are content-addressed: the address is the BLAKE3 hash of the content.
 /// This ensures data integrity - if the content matches the address, the data
 /// is authentic. When a wallet is configured, chunk storage requires EVM payment
 /// on Arbitrum. Without a wallet, chunks can be stored on devnets with EVM disabled.
@@ -128,7 +128,7 @@ impl QuantumClient {
     ///
     /// # Arguments
     ///
-    /// * `address` - The `XorName` address of the chunk (SHA256 of content)
+    /// * `address` - The `XorName` address of the chunk (BLAKE3 of content)
     ///
     /// # Returns
     ///

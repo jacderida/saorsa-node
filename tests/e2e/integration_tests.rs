@@ -317,7 +317,7 @@ async fn test_quantum_client_chunk_round_trip() {
         .await
         .expect("QuantumClient::put_chunk_with_proof should succeed");
 
-    // Address must equal SHA256(content)
+    // Address must equal BLAKE3(content)
     let expected_address = saorsa_node::compute_address(&content);
     assert_eq!(
         address, expected_address,
