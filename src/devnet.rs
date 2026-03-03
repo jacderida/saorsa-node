@@ -14,7 +14,7 @@ use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
-use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
+use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -292,7 +292,7 @@ pub enum NodeState {
 pub struct DevnetNode {
     index: usize,
     label: String,
-    peer_id: String,
+    peer_id: PeerId,
     port: u16,
     address: SocketAddr,
     data_dir: PathBuf,
@@ -531,9 +531,13 @@ impl Devnet {
         // Generate identity first so we can use peer_id as the directory name
         let identity = NodeIdentity::generate()
             .map_err(|e| DevnetError::Core(format!("Failed to generate node identity: {e}")))?;
-        let peer_id = identity.peer_id().to_hex();
+        let peer_id = identity.peer_id().clone();
         let label = format!("devnet_node_{index}");
-        let data_dir = self.config.data_dir.join(NODES_SUBDIR).join(&peer_id);
+        let data_dir = self
+            .config
+            .data_dir
+            .join(NODES_SUBDIR)
+            .join(peer_id.to_hex());
 
         tokio::fs::create_dir_all(&data_dir).await?;
 
