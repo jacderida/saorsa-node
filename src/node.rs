@@ -131,12 +131,10 @@ impl NodeBuilder {
             .await
             .map_err(|e| Error::Startup(format!("Failed to create P2P node: {e}")))?;
 
-        // Create upgrade monitor if enabled
-        let upgrade_monitor = if self.config.upgrade.enabled {
+        // Create upgrade monitor
+        let upgrade_monitor = {
             let node_id_seed = p2p_node.peer_id().as_bytes();
             Some(Self::build_upgrade_monitor(&self.config, node_id_seed))
-        } else {
-            None
         };
 
         // Initialize bootstrap cache manager if enabled
@@ -767,7 +765,6 @@ mod tests {
     fn test_build_upgrade_monitor_staged_rollout_enabled() {
         let config = NodeConfig {
             upgrade: crate::config::UpgradeConfig {
-                enabled: true,
                 staged_rollout_hours: 24,
                 ..Default::default()
             },
@@ -783,7 +780,6 @@ mod tests {
     fn test_build_upgrade_monitor_staged_rollout_disabled() {
         let config = NodeConfig {
             upgrade: crate::config::UpgradeConfig {
-                enabled: true,
                 staged_rollout_hours: 0,
                 ..Default::default()
             },
