@@ -627,8 +627,11 @@ mod tests {
     /// Test 6: Channel filtering - beta includes beta
     #[test]
     fn test_beta_channel_accepts_beta() {
-        let monitor =
-            UpgradeMonitor::new("saorsa-labs/saorsa-node".to_string(), UpgradeChannel::Beta, 24);
+        let monitor = UpgradeMonitor::new(
+            "saorsa-labs/saorsa-node".to_string(),
+            UpgradeChannel::Beta,
+            24,
+        );
 
         let beta_version = Version::parse("1.0.0-beta.1").unwrap();
         assert!(monitor.version_matches_channel(&beta_version));

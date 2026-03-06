@@ -477,7 +477,10 @@ impl RunningNode {
         let actual_port = listen_addrs
             .first()
             .map_or(self.config.port, std::net::SocketAddr::port);
-        info!(port = actual_port, "Node is running on port: {}", actual_port);
+        info!(
+            port = actual_port,
+            "Node is running on port: {}", actual_port
+        );
 
         // Emit started event
         if let Err(e) = self.events_tx.send(NodeEvent::Started) {
@@ -495,8 +498,7 @@ impl RunningNode {
 
             tokio::spawn(async move {
                 let mut monitor = monitor;
-                let mut upgrader = AutoApplyUpgrader::new()
-                    .with_stop_on_upgrade(stop_on_upgrade);
+                let mut upgrader = AutoApplyUpgrader::new().with_stop_on_upgrade(stop_on_upgrade);
                 if let Ok(cache_dir) = upgrade_cache_dir() {
                     upgrader = upgrader.with_binary_cache(BinaryCache::new(cache_dir));
                 }
@@ -565,7 +567,15 @@ impl RunningNode {
                                     }
                                 }
                                 Ok(None) => {
-                                    info!("Already running latest version");
+                                    if let Some(remaining) = monitor.time_until_upgrade() {
+                                        info!(
+                                            "Upgrade pending, rollout delay remaining: {}m {}s",
+                                            remaining.as_secs() / 60,
+                                            remaining.as_secs() % 60
+                                        );
+                                    } else {
+                                        info!("No upgrade available");
+                                    }
                                 }
                                 Err(e) => {
                                     warn!("Error during upgrade process: {}", e);
