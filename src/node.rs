@@ -708,7 +708,6 @@ impl RunningNode {
 mod tests {
     use super::*;
     use crate::config::NODES_SUBDIR;
-    use saorsa_core::identity::PeerId;
 
     #[test]
     fn test_build_upgrade_monitor_staged_rollout_enabled() {
