@@ -1,6 +1,6 @@
 //! Node implementation - thin wrapper around saorsa-core's `P2PNode`.
 
-use crate::ant_protocol::CHUNK_PROTOCOL_ID;
+use crate::ant_protocol::{CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE};
 use crate::config::{
     default_nodes_dir, default_root_dir, EvmNetworkConfig, IpVersion, NetworkMode, NodeConfig,
     NODE_IDENTITY_FILENAME,
@@ -9,12 +9,12 @@ use crate::error::{Error, Result};
 use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEventsSender};
 use crate::payment::metrics::QuotingMetricsTracker;
 use crate::payment::wallet::parse_rewards_address;
-use crate::payment::{PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
+use crate::payment::{EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
-use saorsa_core::identity::{NodeId, NodeIdentity};
+use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
     IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
@@ -23,12 +23,18 @@ use saorsa_core::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Maximum number of records for quoting metrics.
-const DEFAULT_MAX_QUOTING_RECORDS: usize = 100_000;
+/// Node storage capacity limit (5 GB).
+///
+/// Used to derive `max_records` for the quoting metrics pricing curve.
+/// A node advertises `NODE_STORAGE_LIMIT_BYTES / MAX_CHUNK_SIZE` as
+/// its maximum record count, giving the pricing algorithm a meaningful
+/// fullness ratio instead of a hardcoded constant.
+pub const NODE_STORAGE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Default rewards address when none is configured (20-byte zero address).
 const DEFAULT_REWARDS_ADDRESS: [u8; 20] = [0u8; 20];
@@ -56,9 +62,49 @@ impl NodeBuilder {
     pub async fn build(mut self) -> Result<RunningNode> {
         info!("Building saorsa-node with config: {:?}", self.config);
 
+        // Validate production requirements
+        if self.config.network_mode == NetworkMode::Production && !self.config.payment.enabled {
+            return Err(Error::Config(
+                "CRITICAL: Payment verification is REQUIRED in production mode. \
+                 Remove 'enabled = false' from config or --disable-payment-verification flag."
+                    .to_string(),
+            ));
+        }
+
+        // Validate rewards address in production
+        if self.config.network_mode == NetworkMode::Production {
+            match self.config.payment.rewards_address {
+                None => {
+                    return Err(Error::Config(
+                        "CRITICAL: Rewards address is not configured. \
+                         Set payment.rewards_address in config to your Arbitrum wallet address."
+                            .to_string(),
+                    ));
+                }
+                Some(ref addr) if addr == "0xYOUR_ARBITRUM_ADDRESS_HERE" || addr.is_empty() => {
+                    return Err(Error::Config(
+                        "CRITICAL: Rewards address is not configured. \
+                         Set payment.rewards_address in config to your Arbitrum wallet address."
+                            .to_string(),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+
+        // Warn if payment disabled in any mode
+        if !self.config.payment.enabled {
+            let mode = self.config.network_mode;
+            warn!("⚠️  ⚠️  ⚠️");
+            warn!("⚠️  PAYMENT VERIFICATION DISABLED (mode: {mode:?})");
+            warn!("⚠️  This should ONLY be used for testing!");
+            warn!("⚠️  All storage requests will be accepted for FREE");
+            warn!("⚠️  ⚠️  ⚠️");
+        }
+
         // Resolve identity and root_dir (may update self.config.root_dir)
-        let identity = Self::resolve_identity(&mut self.config).await?;
-        let peer_id = node_id_to_peer_id(identity.node_id());
+        let identity = Arc::new(Self::resolve_identity(&mut self.config).await?);
+        let peer_id = identity.peer_id().to_hex();
 
         info!(peer_id = %peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
 
@@ -71,9 +117,11 @@ impl NodeBuilder {
         // Create event channel
         let (events_tx, events_rx) = create_event_channel();
 
-        // Convert our config to saorsa-core's config, injecting our stable peer_id
+        // Convert our config to saorsa-core's config
         let mut core_config = Self::build_core_config(&self.config)?;
-        core_config.peer_id = Some(peer_id);
+        // Inject the ML-DSA identity so the P2PNode's transport peer ID
+        // matches the pub_key embedded in payment quotes.
+        core_config.node_identity = Some(Arc::clone(&identity));
         debug!("Core config: {:?}", core_config);
 
         // Initialize saorsa-core's P2PNode
@@ -99,7 +147,9 @@ impl NodeBuilder {
 
         // Initialize ANT protocol handler for chunk storage
         let ant_protocol = if self.config.storage.enabled {
-            Some(Arc::new(Self::build_ant_protocol(&self.config).await?))
+            Some(Arc::new(
+                Self::build_ant_protocol(&self.config, &identity).await?,
+            ))
         } else {
             info!("Chunk storage disabled");
             None
@@ -123,11 +173,12 @@ impl NodeBuilder {
     /// Build the saorsa-core `NodeConfig` from our config.
     fn build_core_config(config: &NodeConfig) -> Result<CoreNodeConfig> {
         // Determine listen address based on port and IP version
+        let port = config.port;
         let listen_addr: SocketAddr = match config.ip_version {
-            IpVersion::Ipv4 | IpVersion::Dual => format!("0.0.0.0:{}", config.port)
+            IpVersion::Ipv4 | IpVersion::Dual => format!("0.0.0.0:{port}")
                 .parse()
                 .map_err(|e| Error::Config(format!("Invalid listen address: {e}")))?,
-            IpVersion::Ipv6 => format!("[::]:{}", config.port)
+            IpVersion::Ipv6 => format!("[::]:{port}")
                 .parse()
                 .map_err(|e| Error::Config(format!("Invalid listen address: {e}")))?,
         };
@@ -210,7 +261,7 @@ impl NodeBuilder {
                 let identity = NodeIdentity::generate().map_err(|e| {
                     Error::Startup(format!("Failed to generate node identity: {e}"))
                 })?;
-                let peer_id = node_id_to_peer_id(identity.node_id());
+                let peer_id = identity.peer_id().to_hex();
                 let peer_dir = nodes_dir.join(&peer_id);
                 std::fs::create_dir_all(&peer_dir)?;
                 identity
@@ -221,7 +272,9 @@ impl NodeBuilder {
                 Ok(identity)
             }
             1 => {
-                let dir = &identity_dirs[0];
+                let dir = identity_dirs
+                    .first()
+                    .ok_or_else(|| Error::Config("No identity dirs found".to_string()))?;
                 let identity = NodeIdentity::load_from_file(&dir.join(NODE_IDENTITY_FILENAME))
                     .await
                     .map_err(|e| Error::Startup(format!("Failed to load node identity: {e}")))?;
@@ -296,7 +349,11 @@ impl NodeBuilder {
     /// Build the ANT protocol handler from config.
     ///
     /// Initializes LMDB storage, payment verifier, and quote generator.
-    async fn build_ant_protocol(config: &NodeConfig) -> Result<AntProtocol> {
+    /// Wires ML-DSA-65 signing from the node's identity into the quote generator.
+    async fn build_ant_protocol(
+        config: &NodeConfig,
+        identity: &NodeIdentity,
+    ) -> Result<AntProtocol> {
         // Create LMDB storage
         let storage_config = LmdbStorageConfig {
             root_dir: config.root_dir.clone(),
@@ -308,30 +365,37 @@ impl NodeBuilder {
             .await
             .map_err(|e| Error::Startup(format!("Failed to create LMDB storage: {e}")))?;
 
+        // Parse rewards address first (needed by both verifier and quote generator)
+        let rewards_address = match config.payment.rewards_address {
+            Some(ref addr) => parse_rewards_address(addr)?,
+            None => RewardsAddress::new(DEFAULT_REWARDS_ADDRESS),
+        };
+
         // Create payment verifier
         let evm_network = match config.payment.evm_network {
             EvmNetworkConfig::ArbitrumOne => EvmNetwork::ArbitrumOne,
             EvmNetworkConfig::ArbitrumSepolia => EvmNetwork::ArbitrumSepoliaTest,
         };
         let payment_config = PaymentVerifierConfig {
-            evm: crate::payment::EvmVerifierConfig {
+            evm: EvmVerifierConfig {
                 enabled: config.payment.enabled,
                 network: evm_network,
             },
             cache_capacity: config.payment.cache_capacity,
+            local_rewards_address: Some(rewards_address),
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
+        // Safe: 5GB fits in usize on all supported 64-bit platforms.
+        #[allow(clippy::cast_possible_truncation)]
+        let max_records = (NODE_STORAGE_LIMIT_BYTES as usize) / MAX_CHUNK_SIZE;
+        let metrics_tracker = QuotingMetricsTracker::new(max_records, 0);
+        let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
-        // Create quote generator
-        let rewards_address = match config.payment.rewards_address {
-            Some(ref addr) => parse_rewards_address(addr)?,
-            None => RewardsAddress::new(DEFAULT_REWARDS_ADDRESS),
-        };
-        let metrics_tracker = QuotingMetricsTracker::new(DEFAULT_MAX_QUOTING_RECORDS, 0);
-        let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+        // Wire ML-DSA-65 signing from node identity
+        crate::payment::wire_ml_dsa_signer(&mut quote_generator, identity)?;
 
         info!(
-            "ANT protocol handler initialized (protocol={})",
+            "ANT protocol handler initialized with ML-DSA-65 signing (protocol={})",
             CHUNK_PROTOCOL_ID
         );
 
@@ -352,7 +416,7 @@ impl NodeBuilder {
 
         // Create cache directory
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-            warn!("Failed to create bootstrap cache directory: {}", e);
+            warn!("Failed to create bootstrap cache directory: {e}");
             return None;
         }
 
@@ -371,16 +435,11 @@ impl NodeBuilder {
                 Some(manager)
             }
             Err(e) => {
-                warn!("Failed to initialize bootstrap cache: {}", e);
+                warn!("Failed to initialize bootstrap cache: {e}");
                 None
             }
         }
     }
-}
-
-/// Convert a `NodeId` to a hex-encoded `PeerId` string (full 64 hex chars).
-fn node_id_to_peer_id(node_id: &NodeId) -> String {
-    hex::encode(node_id.0)
 }
 
 /// A running saorsa node.
@@ -481,13 +540,13 @@ impl RunningNode {
                                         // If we reach here, exec() failed or not supported
                                     }
                                     Ok(UpgradeResult::RolledBack { reason }) => {
-                                        warn!("Upgrade rolled back: {}", reason);
+                                        warn!("Upgrade rolled back: {reason}");
                                     }
                                     Ok(UpgradeResult::NoUpgrade) => {
                                         debug!("No upgrade needed");
                                     }
                                     Err(e) => {
-                                        error!("Critical upgrade error: {}", e);
+                                        error!("Critical upgrade error: {e}");
                                     }
                                 }
                             }
@@ -514,7 +573,7 @@ impl RunningNode {
                     );
                 }
                 Err(e) => {
-                    debug!("Failed to get bootstrap cache stats: {}", e);
+                    debug!("Failed to get bootstrap cache stats: {e}");
                 }
             }
         }
@@ -560,8 +619,7 @@ impl RunningNode {
                     break;
                 }
                 _ = sighup.recv() => {
-                    info!("Received SIGHUP, could reload config here");
-                    // TODO: Implement config reload on SIGHUP
+                    info!("Received SIGHUP (config reload not yet supported)");
                 }
             }
         }
@@ -599,34 +657,36 @@ impl RunningNode {
 
         let mut events = self.p2p_node.subscribe_events();
         let p2p = Arc::clone(&self.p2p_node);
+        let semaphore = Arc::new(Semaphore::new(64));
 
         self.protocol_task = Some(tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
                 if let P2PEvent::Message {
                     topic,
-                    source,
+                    source: Some(source),
                     data,
                 } = event
                 {
                     if topic == CHUNK_PROTOCOL_ID {
-                        debug!("Received chunk protocol message from {}", source);
+                        debug!("Received chunk protocol message from {source}");
                         let protocol = Arc::clone(&protocol);
                         let p2p = Arc::clone(&p2p);
+                        let sem = semaphore.clone();
                         tokio::spawn(async move {
+                            let Ok(_permit) = sem.acquire().await else {
+                                return;
+                            };
                             match protocol.handle_message(&data).await {
                                 Ok(response) => {
                                     if let Err(e) = p2p
                                         .send_message(&source, CHUNK_PROTOCOL_ID, response.to_vec())
                                         .await
                                     {
-                                        warn!(
-                                            "Failed to send protocol response to {}: {}",
-                                            source, e
-                                        );
+                                        warn!("Failed to send protocol response to {source}: {e}");
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Protocol handler error: {}", e);
+                                    warn!("Protocol handler error: {e}");
                                 }
                             }
                         });
@@ -758,7 +818,7 @@ mod tests {
         // Key file should exist
         assert!(tmp.path().join(NODE_IDENTITY_FILENAME).exists());
         // peer_id should be derivable from the identity
-        let peer_id = node_id_to_peer_id(identity.node_id());
+        let peer_id = identity.peer_id().to_hex();
         assert_eq!(peer_id.len(), 64); // 32 bytes hex-encoded
     }
 
@@ -779,14 +839,14 @@ mod tests {
         };
 
         let loaded = NodeBuilder::resolve_identity(&mut config).await.unwrap();
-        assert_eq!(loaded.node_id(), original.node_id());
+        assert_eq!(loaded.peer_id(), original.peer_id());
     }
 
     #[test]
-    fn test_node_id_to_peer_id_length() {
-        let id = NodeId::from_bytes([0x42; 32]);
-        let peer_id = node_id_to_peer_id(&id);
-        assert_eq!(peer_id.len(), 64); // 32 bytes = 64 hex chars
+    fn test_peer_id_hex_length() {
+        let id = saorsa_core::identity::PeerId::from_bytes([0x42; 32]);
+        let hex = id.to_hex();
+        assert_eq!(hex.len(), 64); // 32 bytes = 64 hex chars
     }
 
     /// Simulates a node restart: first run creates identity in a scoped subdir
@@ -799,7 +859,7 @@ mod tests {
 
         // First "boot": generate identity, save it in nodes/{peer_id}/
         let identity1 = NodeIdentity::generate().unwrap();
-        let peer_id1 = node_id_to_peer_id(identity1.node_id());
+        let peer_id1 = identity1.peer_id().to_hex();
         let peer_dir = nodes_dir.join(&peer_id1);
         std::fs::create_dir_all(&peer_dir).unwrap();
         identity1
@@ -817,7 +877,7 @@ mod tests {
         let loaded = NodeIdentity::load_from_file(&identity_dirs[0].join(NODE_IDENTITY_FILENAME))
             .await
             .unwrap();
-        let peer_id2 = node_id_to_peer_id(loaded.node_id());
+        let peer_id2 = loaded.peer_id().to_hex();
 
         assert_eq!(peer_id1, peer_id2, "peer_id must survive restart");
         assert_eq!(
@@ -869,8 +929,8 @@ mod tests {
         let identity2 = NodeBuilder::resolve_identity(&mut config2).await.unwrap();
 
         assert_eq!(
-            identity1.node_id(),
-            identity2.node_id(),
+            identity1.peer_id(),
+            identity2.peer_id(),
             "explicit --root-dir must yield stable identity"
         );
     }

@@ -6,11 +6,10 @@
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// `XorName` type - 32-byte content hash.
-/// TODO: Import from saorsa-core or ant-protocol when available.
-pub type XorName = [u8; 32];
+pub use super::quote::XorName;
 
 /// Default cache capacity (100,000 entries = 3.2MB memory).
 const DEFAULT_CACHE_CAPACITY: usize = 100_000;
@@ -22,11 +21,13 @@ const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 #[derive(Clone)]
 pub struct VerifiedCache {
     inner: Arc<Mutex<LruCache<XorName, ()>>>,
-    stats: Arc<Mutex<CacheStats>>,
+    hits: Arc<AtomicU64>,
+    misses: Arc<AtomicU64>,
+    additions: Arc<AtomicU64>,
 }
 
 /// Cache statistics for monitoring.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct CacheStats {
     /// Number of cache hits.
     pub hits: u64,
@@ -69,7 +70,9 @@ impl VerifiedCache {
         let cap = NonZeroUsize::new(effective_capacity).unwrap_or(NonZeroUsize::MIN);
         Self {
             inner: Arc::new(Mutex::new(LruCache::new(cap))),
-            stats: Arc::new(Mutex::new(CacheStats::default())),
+            hits: Arc::new(AtomicU64::new(0)),
+            misses: Arc::new(AtomicU64::new(0)),
+            additions: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -80,13 +83,11 @@ impl VerifiedCache {
     pub fn contains(&self, xorname: &XorName) -> bool {
         let found = self.inner.lock().get(xorname).is_some();
 
-        let mut stats = self.stats.lock();
         if found {
-            stats.hits += 1;
+            self.hits.fetch_add(1, Ordering::Relaxed);
         } else {
-            stats.misses += 1;
+            self.misses.fetch_add(1, Ordering::Relaxed);
         }
-        drop(stats);
 
         found
     }
@@ -96,13 +97,17 @@ impl VerifiedCache {
     /// This should be called after verifying that data exists on the autonomi network.
     pub fn insert(&self, xorname: XorName) {
         self.inner.lock().put(xorname, ());
-        self.stats.lock().additions += 1;
+        self.additions.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get current cache statistics.
     #[must_use]
     pub fn stats(&self) -> CacheStats {
-        self.stats.lock().clone()
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            additions: self.additions.load(Ordering::Relaxed),
+        }
     }
 
     /// Get the current number of entries in the cache.
@@ -130,6 +135,7 @@ impl Default for VerifiedCache {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -213,5 +219,110 @@ mod tests {
 
         cache.clear();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_with_capacity_zero_defaults_to_one() {
+        let cache = VerifiedCache::with_capacity(0);
+        // Should be able to store at least 1 element
+        cache.insert([1u8; 32]);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_default_impl() {
+        let cache = VerifiedCache::default();
+        assert!(cache.is_empty());
+        cache.insert([1u8; 32]);
+        assert!(cache.contains(&[1u8; 32]));
+    }
+
+    #[test]
+    fn test_hit_rate_zero_total() {
+        let stats = CacheStats::default();
+        assert!(stats.hit_rate().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_hit_rate_all_hits() {
+        let stats = CacheStats {
+            hits: 10,
+            misses: 0,
+            additions: 0,
+        };
+        assert!((stats.hit_rate() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_hit_rate_all_misses() {
+        let stats = CacheStats {
+            hits: 0,
+            misses: 10,
+            additions: 0,
+        };
+        assert!(stats.hit_rate().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_clear_does_not_reset_stats() {
+        let cache = VerifiedCache::new();
+        cache.insert([1u8; 32]);
+        let _ = cache.contains(&[1u8; 32]); // hit
+        let _ = cache.contains(&[2u8; 32]); // miss
+
+        cache.clear();
+
+        // Stats should persist after clear
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.additions, 1);
+    }
+
+    #[test]
+    fn test_concurrent_insert_and_contains() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(VerifiedCache::with_capacity(1000));
+        let mut handles = Vec::new();
+
+        // 10 threads inserting
+        for i in 0..10u8 {
+            let c = cache.clone();
+            handles.push(thread::spawn(move || {
+                let xorname = [i; 32];
+                c.insert(xorname);
+            }));
+        }
+
+        // 10 threads checking
+        for i in 0..10u8 {
+            let c = cache.clone();
+            handles.push(thread::spawn(move || {
+                let xorname = [i; 32];
+                let _ = c.contains(&xorname);
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
+
+        // All 10 should have been inserted
+        assert_eq!(cache.len(), 10);
+    }
+
+    #[test]
+    fn test_cache_stats_copy() {
+        let stats = CacheStats {
+            hits: 5,
+            misses: 3,
+            additions: 8,
+        };
+        let stats2 = stats; // Copy
+        assert_eq!(stats.hits, stats2.hits);
+        assert_eq!(stats.misses, stats2.misses);
+        assert_eq!(stats.additions, stats2.additions);
     }
 }

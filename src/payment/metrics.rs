@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+/// Number of operations between disk persists (debounce).
+const PERSIST_INTERVAL: usize = 10;
+
 /// Tracker for quoting metrics.
 ///
 /// Maintains state that influences quote pricing, including payment history,
@@ -32,6 +35,8 @@ pub struct QuotingMetricsTracker {
     persist_path: Option<PathBuf>,
     /// Estimated network size.
     network_size: AtomicU64,
+    /// Operations since last persist (for debouncing disk I/O).
+    ops_since_persist: AtomicUsize,
 }
 
 impl QuotingMetricsTracker {
@@ -51,6 +56,7 @@ impl QuotingMetricsTracker {
             start_time: Instant::now(),
             persist_path: None,
             network_size: AtomicU64::new(500), // Conservative default
+            ops_since_persist: AtomicUsize::new(0),
         }
     }
 
@@ -86,8 +92,8 @@ impl QuotingMetricsTracker {
     /// Record a payment received.
     pub fn record_payment(&self) {
         let count = self.received_payment_count.fetch_add(1, Ordering::SeqCst) + 1;
-        debug!("Payment received, total count: {}", count);
-        self.persist();
+        debug!("Payment received, total count: {count}");
+        self.maybe_persist();
     }
 
     /// Record data stored.
@@ -102,13 +108,13 @@ impl QuotingMetricsTracker {
         {
             let mut records = self.records_per_type.write();
             if let Some(entry) = records.iter_mut().find(|(t, _)| *t == data_type) {
-                entry.1 += 1;
+                entry.1 = entry.1.saturating_add(1);
             } else {
                 records.push((data_type, 1));
             }
         }
 
-        self.persist();
+        self.maybe_persist();
     }
 
     /// Get the number of payments received.
@@ -150,8 +156,16 @@ impl QuotingMetricsTracker {
             max_records: self.max_records,
             received_payment_count: self.received_payment_count.load(Ordering::SeqCst),
             live_time: self.live_time_hours(),
-            network_density: None, // TODO: Calculate from DHT
+            network_density: None, // Not used in pricing; reserved for future DHT range filtering
             network_size: Some(self.network_size.load(Ordering::SeqCst)),
+        }
+    }
+
+    /// Debounced persist: only writes to disk every `PERSIST_INTERVAL` operations.
+    fn maybe_persist(&self) {
+        let ops = self.ops_since_persist.fetch_add(1, Ordering::Relaxed);
+        if ops % PERSIST_INTERVAL == 0 {
+            self.persist();
         }
     }
 
@@ -166,7 +180,7 @@ impl QuotingMetricsTracker {
 
             if let Ok(bytes) = rmp_serde::to_vec(&data) {
                 if let Err(e) = std::fs::write(path, bytes) {
-                    warn!("Failed to persist metrics: {}", e);
+                    warn!("Failed to persist metrics: {e}");
                 }
             }
         }
@@ -176,6 +190,12 @@ impl QuotingMetricsTracker {
     fn load_from_disk(path: &std::path::Path) -> Option<PersistedMetrics> {
         let bytes = std::fs::read(path).ok()?;
         rmp_serde::from_slice(&bytes).ok()
+    }
+}
+
+impl Drop for QuotingMetricsTracker {
+    fn drop(&mut self) {
+        self.persist();
     }
 }
 
@@ -259,5 +279,98 @@ mod tests {
         let tracker = QuotingMetricsTracker::with_persistence(1000, &path);
         assert_eq!(tracker.payment_count(), 2);
         assert_eq!(tracker.records_stored(), 1);
+    }
+
+    #[test]
+    fn test_live_time_hours() {
+        let tracker = QuotingMetricsTracker::new(1000, 0);
+        // Just started, so live_time should be 0 hours
+        assert_eq!(tracker.live_time_hours(), 0);
+    }
+
+    #[test]
+    fn test_set_network_size() {
+        let tracker = QuotingMetricsTracker::new(1000, 0);
+        tracker.set_network_size(1000);
+
+        let metrics = tracker.get_metrics(0, 0);
+        assert_eq!(metrics.network_size, Some(1000));
+    }
+
+    #[test]
+    fn test_records_per_type_multiple_types() {
+        let tracker = QuotingMetricsTracker::new(1000, 0);
+
+        tracker.record_store(0);
+        tracker.record_store(0);
+        tracker.record_store(1);
+        tracker.record_store(2);
+        tracker.record_store(1);
+
+        let metrics = tracker.get_metrics(0, 0);
+        assert_eq!(metrics.records_per_type.len(), 3);
+
+        // Verify per-type counts
+        let type_0 = metrics.records_per_type.iter().find(|(t, _)| *t == 0);
+        let type_1 = metrics.records_per_type.iter().find(|(t, _)| *t == 1);
+        let type_2 = metrics.records_per_type.iter().find(|(t, _)| *t == 2);
+
+        assert_eq!(type_0.expect("type 0 exists").1, 2);
+        assert_eq!(type_1.expect("type 1 exists").1, 2);
+        assert_eq!(type_2.expect("type 2 exists").1, 1);
+    }
+
+    #[test]
+    fn test_persistence_round_trip_with_types() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("metrics_types.bin");
+
+        {
+            let tracker = QuotingMetricsTracker::with_persistence(1000, &path);
+            tracker.record_store(0);
+            tracker.record_store(0);
+            tracker.record_store(1);
+            tracker.record_payment();
+        }
+
+        let tracker = QuotingMetricsTracker::with_persistence(1000, &path);
+        assert_eq!(tracker.payment_count(), 1);
+        assert_eq!(tracker.records_stored(), 3); // 2 type-0 + 1 type-1
+
+        let metrics = tracker.get_metrics(0, 0);
+        assert_eq!(metrics.records_per_type.len(), 2);
+    }
+
+    #[test]
+    fn test_with_persistence_nonexistent_path() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("nonexistent_subdir").join("metrics.bin");
+
+        // Should not panic — just starts with defaults
+        let tracker = QuotingMetricsTracker::with_persistence(1000, &path);
+        assert_eq!(tracker.payment_count(), 0);
+        assert_eq!(tracker.records_stored(), 0);
+    }
+
+    #[test]
+    fn test_max_records_zero() {
+        let tracker = QuotingMetricsTracker::new(0, 0);
+        let metrics = tracker.get_metrics(1024, 0);
+        assert_eq!(metrics.max_records, 0);
+    }
+
+    #[test]
+    fn test_get_metrics_passes_data_params() {
+        let tracker = QuotingMetricsTracker::new(1000, 0);
+        let metrics = tracker.get_metrics(4096, 3);
+        assert_eq!(metrics.data_size, 4096);
+        assert_eq!(metrics.data_type, 3);
+    }
+
+    #[test]
+    fn test_default_network_size() {
+        let tracker = QuotingMetricsTracker::new(1000, 0);
+        let metrics = tracker.get_metrics(0, 0);
+        assert_eq!(metrics.network_size, Some(500));
     }
 }

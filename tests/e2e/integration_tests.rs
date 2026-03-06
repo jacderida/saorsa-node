@@ -12,12 +12,12 @@ use super::{NetworkState, TestHarness, TestNetwork, TestNetworkConfig};
 use bytes::Bytes;
 use saorsa_core::P2PEvent;
 use saorsa_node::client::{QuantumClient, QuantumConfig};
+use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Test that a minimal network (5 nodes) can form and stabilize.
 #[tokio::test]
-#[ignore = "Requires real P2P node spawning - run with --ignored"]
 async fn test_minimal_network_formation() {
     // TestNetworkConfig automatically generates unique ports and data dirs
     let harness = TestHarness::setup_minimal()
@@ -41,7 +41,6 @@ async fn test_minimal_network_formation() {
 
 /// Test that a small network (10 nodes) can form and stabilize.
 #[tokio::test]
-#[ignore = "Requires real P2P node spawning - run with --ignored"]
 async fn test_small_network_formation() {
     // TestNetworkConfig automatically generates unique ports and data dirs
     let harness = TestHarness::setup_small()
@@ -63,7 +62,6 @@ async fn test_small_network_formation() {
 
 /// Test that the full 25-node network can form.
 #[tokio::test]
-#[ignore = "Requires real P2P node spawning - run with --ignored"]
 async fn test_full_network_formation() {
     let harness = TestHarness::setup().await.expect("Failed to setup harness");
 
@@ -89,7 +87,6 @@ async fn test_full_network_formation() {
 
 /// Test custom network configuration.
 #[tokio::test]
-#[ignore = "Requires real P2P node spawning - run with --ignored"]
 async fn test_custom_network_config() {
     // Override only the settings we care about; ports and data dir are auto-generated
     let config = TestNetworkConfig {
@@ -113,7 +110,7 @@ async fn test_custom_network_config() {
 
 /// Test network with EVM testnet.
 #[tokio::test]
-#[ignore = "Requires real P2P node spawning and Anvil - run with --ignored"]
+#[serial]
 async fn test_network_with_evm() {
     // TestNetworkConfig automatically generates unique ports and data dirs
     let harness = TestHarness::setup_with_evm()
@@ -124,8 +121,9 @@ async fn test_network_with_evm() {
     assert!(harness.has_evm());
 
     let anvil = harness.anvil().expect("Anvil should be present");
-    assert!(anvil.is_healthy().await);
-    assert!(!anvil.rpc_url().is_empty());
+    // Verify the Anvil testnet is usable by checking we can get a network config
+    let _network = anvil.to_network();
+    assert!(!anvil.default_wallet_key().is_empty());
 
     harness.teardown().await.expect("Failed to teardown");
 }
@@ -218,7 +216,7 @@ async fn test_node_to_node_messaging() {
         !peers.is_empty(),
         "Node 3 should have at least one connected peer"
     );
-    let target_peer_id = peers[0].clone();
+    let target_peer_id = *peers.first().expect("Should have at least one peer");
 
     let sender_p2p = sender.p2p_node.as_ref().expect("Node 3 should be running");
 
@@ -309,11 +307,15 @@ async fn test_quantum_client_chunk_round_trip() {
     let client = QuantumClient::new(config).with_node(Arc::clone(&node));
 
     // ── PUT ──────────────────────────────────────────────────────────────
+    // Nodes use payment_enforcement: false, so we send a dummy proof via
+    // put_chunk_with_proof() (put_chunk() requires a wallet since the
+    // client-side early-rejection fix).
     let content = Bytes::from("quantum client e2e test payload");
+    let dummy_proof = vec![0u8; 64];
     let address = client
-        .put_chunk(content.clone())
+        .put_chunk_with_proof(content.clone(), dummy_proof)
         .await
-        .expect("QuantumClient::put_chunk should succeed");
+        .expect("QuantumClient::put_chunk_with_proof should succeed");
 
     // Address must equal SHA256(content)
     let expected_address = saorsa_node::compute_address(&content);

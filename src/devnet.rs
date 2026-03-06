@@ -11,6 +11,7 @@ use crate::payment::{
 };
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use ant_evm::RewardsAddress;
+use evmlib::Network as EvmNetwork;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
@@ -160,6 +161,15 @@ pub struct DevnetConfig {
 
     /// Whether to remove the data directory on shutdown.
     pub cleanup_data_dir: bool,
+
+    /// Enable EVM payment enforcement on all nodes.
+    /// When true, nodes will require valid on-chain payment proofs.
+    pub enable_evm: bool,
+
+    /// Optional EVM network for payment verification.
+    /// When `enable_evm` is true and this is `Some`, nodes will use
+    /// this network (e.g. Anvil testnet) for on-chain verification.
+    pub evm_network: Option<EvmNetwork>,
 }
 
 impl Default for DevnetConfig {
@@ -180,6 +190,8 @@ impl Default for DevnetConfig {
             node_startup_timeout: Duration::from_secs(DEFAULT_NODE_STARTUP_TIMEOUT_SECS),
             enable_node_logging: false,
             cleanup_data_dir: true,
+            enable_evm: false,
+            evm_network: None,
         }
     }
 }
@@ -221,6 +233,22 @@ pub struct DevnetManifest {
     pub data_dir: PathBuf,
     /// Creation time in RFC3339.
     pub created_at: String,
+    /// EVM configuration (present when EVM payment enforcement is enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm: Option<DevnetEvmInfo>,
+}
+
+/// EVM configuration info included in the devnet manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevnetEvmInfo {
+    /// Anvil RPC URL.
+    pub rpc_url: String,
+    /// Funded wallet private key (hex-encoded with 0x prefix).
+    pub wallet_private_key: String,
+    /// Payment token contract address.
+    pub payment_token_address: String,
+    /// Data payments contract address.
+    pub data_payments_address: String,
 }
 
 /// Network state for devnet startup lifecycle.
@@ -317,25 +345,23 @@ impl Devnet {
             ));
         }
 
+        let node_count = config.node_count;
+        let node_count_u16 = u16::try_from(node_count).map_err(|_| {
+            DevnetError::Config(format!("Node count {node_count} exceeds u16::MAX"))
+        })?;
+
         if config.base_port == 0 {
             let mut rng = rand::thread_rng();
-            let node_count_u16 = u16::try_from(config.node_count).map_err(|_| {
-                DevnetError::Config(format!("Node count {} exceeds u16::MAX", config.node_count))
-            })?;
             let max_base_port = DEVNET_PORT_RANGE_MAX.saturating_sub(node_count_u16);
             config.base_port = rng.gen_range(DEVNET_PORT_RANGE_MIN..max_base_port);
         }
 
-        let node_count_u16 = u16::try_from(config.node_count).map_err(|_| {
-            DevnetError::Config(format!("Node count {} exceeds u16::MAX", config.node_count))
-        })?;
-        let max_port = config
-            .base_port
+        let base_port = config.base_port;
+        let max_port = base_port
             .checked_add(node_count_u16)
             .ok_or_else(|| {
                 DevnetError::Config(format!(
-                    "Port range overflow: base_port {} + node_count {} exceeds u16::MAX",
-                    config.base_port, config.node_count
+                    "Port range overflow: base_port {base_port} + node_count {node_count} exceeds u16::MAX"
                 ))
             })?;
         if max_port > DEVNET_PORT_RANGE_MAX {
@@ -412,7 +438,7 @@ impl Devnet {
             shutdown_futures.push(async move {
                 if let Some(p2p) = p2p_node {
                     if let Err(e) = p2p.shutdown().await {
-                        warn!("Error shutting down node {}: {}", node_index, e);
+                        warn!("Error shutting down node {node_index}: {e}");
                     }
                 }
                 *node_state.write().await = NodeState::Stopped;
@@ -422,7 +448,7 @@ impl Devnet {
 
         if self.config.cleanup_data_dir {
             if let Err(e) = tokio::fs::remove_dir_all(&self.config.data_dir).await {
-                warn!("Failed to cleanup devnet data directory: {}", e);
+                warn!("Failed to cleanup devnet data directory: {e}");
             }
         }
 
@@ -467,7 +493,16 @@ impl Devnet {
         let regular_count = self.config.node_count - self.config.bootstrap_count;
         info!("Starting {} regular nodes", regular_count);
 
-        let bootstrap_addrs: Vec<SocketAddr> = self.nodes[0..self.config.bootstrap_count]
+        let bootstrap_addrs: Vec<SocketAddr> = self
+            .nodes
+            .get(0..self.config.bootstrap_count)
+            .ok_or_else(|| {
+                DevnetError::Config(format!(
+                    "Bootstrap count {} exceeds nodes length {}",
+                    self.config.bootstrap_count,
+                    self.nodes.len()
+                ))
+            })?
             .iter()
             .map(|n| n.address)
             .collect();
@@ -496,7 +531,7 @@ impl Devnet {
         // Generate identity first so we can use peer_id as the directory name
         let identity = NodeIdentity::generate()
             .map_err(|e| DevnetError::Core(format!("Failed to generate node identity: {e}")))?;
-        let peer_id = hex::encode(identity.node_id().0);
+        let peer_id = identity.peer_id().to_hex();
         let node_id = format!("devnet_node_{index}");
         let data_dir = self.config.data_dir.join(NODES_SUBDIR).join(&peer_id);
 
@@ -507,7 +542,7 @@ impl Devnet {
             .await
             .map_err(|e| DevnetError::Core(format!("Failed to save node identity: {e}")))?;
 
-        let ant_protocol = Self::create_ant_protocol(&data_dir).await?;
+        let ant_protocol = Self::create_ant_protocol(&data_dir, &identity, &self.config).await?;
 
         Ok(DevnetNode {
             index,
@@ -525,7 +560,11 @@ impl Devnet {
         })
     }
 
-    async fn create_ant_protocol(data_dir: &std::path::Path) -> Result<AntProtocol> {
+    async fn create_ant_protocol(
+        data_dir: &std::path::Path,
+        identity: &NodeIdentity,
+        config: &DevnetConfig,
+    ) -> Result<AntProtocol> {
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
@@ -536,19 +575,36 @@ impl Devnet {
             .await
             .map_err(|e| DevnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
 
-        let payment_config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
+        let evm_config = if config.enable_evm {
+            EvmVerifierConfig {
+                enabled: true,
+                network: config
+                    .evm_network
+                    .clone()
+                    .unwrap_or(EvmNetwork::ArbitrumOne),
+            }
+        } else {
+            EvmVerifierConfig {
                 enabled: false,
                 ..Default::default()
-            },
+            }
+        };
+
+        let payment_config = PaymentVerifierConfig {
+            evm: evm_config,
             cache_capacity: DEVNET_PAYMENT_CACHE_CAPACITY,
+            local_rewards_address: None,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
 
         let rewards_address = RewardsAddress::new(DEVNET_REWARDS_ADDRESS);
         let metrics_tracker =
             QuotingMetricsTracker::new(DEVNET_MAX_RECORDS, DEVNET_INITIAL_RECORDS);
-        let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+        let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        // Wire ML-DSA-65 signing from the devnet node's identity
+        crate::payment::wire_ml_dsa_signer(&mut quote_generator, identity)
+            .map_err(|e| DevnetError::Startup(format!("Failed to wire ML-DSA-65 signer: {e}")))?;
 
         Ok(AntProtocol::new(
             Arc::new(storage),
@@ -564,7 +620,6 @@ impl Devnet {
         let mut core_config = CoreNodeConfig::new()
             .map_err(|e| DevnetError::Core(format!("Failed to create core config: {e}")))?;
 
-        core_config.peer_id = Some(node.peer_id.clone());
         core_config.listen_addr = node.address;
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false;
@@ -573,13 +628,15 @@ impl Devnet {
             .clone_from(&node.bootstrap_addrs);
         core_config.max_message_size = Some(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
 
-        let p2p_node = P2PNode::new(core_config).await.map_err(|e| {
-            DevnetError::Startup(format!("Failed to create node {}: {e}", node.index))
-        })?;
+        let index = node.index;
+        let p2p_node = P2PNode::new(core_config)
+            .await
+            .map_err(|e| DevnetError::Startup(format!("Failed to create node {index}: {e}")))?;
 
-        p2p_node.start().await.map_err(|e| {
-            DevnetError::Startup(format!("Failed to start node {}: {e}", node.index))
-        })?;
+        p2p_node
+            .start()
+            .await
+            .map_err(|e| DevnetError::Startup(format!("Failed to start node {index}: {e}")))?;
 
         node.p2p_node = Some(Arc::new(p2p_node));
         *node.state.write().await = NodeState::Running;
@@ -593,14 +650,13 @@ impl Devnet {
                 while let Ok(event) = events.recv().await {
                     if let P2PEvent::Message {
                         topic,
-                        source,
+                        source: Some(source),
                         data,
                     } = event
                     {
                         if topic == CHUNK_PROTOCOL_ID {
                             debug!(
-                                "Node {} received chunk protocol message from {}",
-                                node_index, source
+                                "Node {node_index} received chunk protocol message from {source}"
                             );
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
@@ -616,13 +672,12 @@ impl Devnet {
                                             .await
                                         {
                                             warn!(
-                                                "Node {} failed to send response to {}: {}",
-                                                node_index, source, e
+                                                "Node {node_index} failed to send response to {source}: {e}"
                                             );
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("Node {} protocol handler error: {}", node_index, e);
+                                        warn!("Node {node_index} protocol handler error: {e}");
                                     }
                                 }
                             });
@@ -642,7 +697,13 @@ impl Devnet {
 
         for i in range {
             while Instant::now() < deadline {
-                let state = self.nodes[i].state.read().await.clone();
+                let node = self.nodes.get(i).ok_or_else(|| {
+                    DevnetError::Config(format!(
+                        "Node index {i} out of bounds (len: {})",
+                        self.nodes.len()
+                    ))
+                })?;
+                let state = node.state.read().await.clone();
                 match state {
                     NodeState::Running | NodeState::Connected => break,
                     NodeState::Failed(ref e) => {

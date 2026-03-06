@@ -47,6 +47,15 @@ mod integration_tests;
 #[cfg(test)]
 mod live_testnet;
 
+#[cfg(test)]
+mod payment_flow;
+
+#[cfg(test)]
+mod complete_payment_e2e;
+
+#[cfg(test)]
+mod security_attacks;
+
 pub use anvil::TestAnvil;
 pub use harness::TestHarness;
 pub use testnet::{NetworkState, NodeState, TestNetwork, TestNetworkConfig, TestNode};
