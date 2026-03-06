@@ -54,7 +54,7 @@ pub async fn send_and_await_chunk_response<T, E>(
                 topic,
                 source: Some(source),
                 data,
-            })) if topic == CHUNK_PROTOCOL_ID && source.as_ref() == Some(target_peer) => {
+            })) if topic == CHUNK_PROTOCOL_ID && source == *target_peer => {
                 let response = match ChunkMessage::decode(&data) {
                     Ok(r) => r,
                     Err(e) => {
