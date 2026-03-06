@@ -216,7 +216,7 @@ async fn test_node_to_node_messaging() {
         !peers.is_empty(),
         "Node 3 should have at least one connected peer"
     );
-    let target_peer_id = *peers.first().expect("Should have at least one peer");
+    let target_peer_id = peers[0];
 
     let sender_p2p = sender.p2p_node.as_ref().expect("Node 3 should be running");
 
@@ -317,7 +317,7 @@ async fn test_quantum_client_chunk_round_trip() {
         .await
         .expect("QuantumClient::put_chunk_with_proof should succeed");
 
-    // Address must equal SHA256(content)
+    // Address must equal BLAKE3(content)
     let expected_address = saorsa_node::compute_address(&content);
     assert_eq!(
         address, expected_address,

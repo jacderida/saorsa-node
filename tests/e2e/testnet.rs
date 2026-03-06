@@ -19,6 +19,7 @@ use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
 use futures::future::join_all;
 use rand::Rng;
+use saorsa_core::identity::PeerId;
 use saorsa_core::{
     identity::NodeIdentity, IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig,
     P2PEvent, P2PNode,
@@ -595,7 +596,7 @@ impl TestNode {
     }
 
     /// Get the list of connected peer IDs.
-    pub async fn connected_peers(&self) -> Vec<saorsa_core::identity::PeerId> {
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
         if let Some(ref node) = self.p2p_node {
             node.connected_peers().await
         } else {
@@ -778,11 +779,10 @@ impl TestNode {
     /// sent, the response times out, or the remote peer reports an error.
     pub async fn store_chunk_on_peer(
         &self,
-        target_peer_id: &saorsa_core::identity::PeerId,
+        target_peer_id: &PeerId,
         data: &[u8],
     ) -> Result<XorName> {
         let p2p = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
-        let target_peer_id = *target_peer_id;
 
         // Create PUT request WITHOUT payment proof (EVM disabled in tests)
         let address = Self::compute_chunk_address(data);
@@ -802,7 +802,7 @@ impl TestNode {
 
         send_and_await_chunk_response(
             p2p,
-            &target_peer_id,
+            target_peer_id,
             message_bytes,
             request_id,
             timeout,
@@ -877,11 +877,10 @@ impl TestNode {
     /// sent, the response times out, or the remote peer reports an error.
     pub async fn get_chunk_from_peer(
         &self,
-        target_peer_id: &saorsa_core::identity::PeerId,
+        target_peer_id: &PeerId,
         address: &XorName,
     ) -> Result<Option<DataChunk>> {
         let p2p = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
-        let target_peer_id = *target_peer_id;
 
         // Create GET request
         let request_id: u64 = rand::thread_rng().gen();
@@ -899,7 +898,7 @@ impl TestNode {
 
         send_and_await_chunk_response(
             p2p,
-            &target_peer_id,
+            target_peer_id,
             message_bytes,
             request_id,
             timeout,
@@ -941,7 +940,7 @@ impl TestNode {
         .await
     }
 
-    /// Compute content address for chunk data (SHA256 hash).
+    /// Compute content address for chunk data (BLAKE3 hash).
     #[must_use]
     pub fn compute_chunk_address(data: &[u8]) -> XorName {
         saorsa_node::compute_address(data)
@@ -1110,7 +1109,6 @@ impl TestNetwork {
         let regular_count = self.config.node_count - self.config.bootstrap_count;
         info!("Starting {} regular nodes", regular_count);
 
-        // Get bootstrap addresses
         let bootstrap_addrs: Vec<SocketAddr> = self
             .nodes
             .get(0..self.config.bootstrap_count)
@@ -1285,6 +1283,14 @@ impl TestNetwork {
         // Override the transport-layer message size to accommodate max-size
         // chunks (4 MiB payload + serialization overhead = 5 MiB wire).
         core_config.max_message_size = Some(saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
+        // Generate a node identity so auto identity announce works on connect.
+        let identity = NodeIdentity::generate().map_err(|e| {
+            TestnetError::Core(format!(
+                "Failed to generate identity for node {}: {e}",
+                node.index
+            ))
+        })?;
+        core_config.node_identity = Some(Arc::new(identity));
 
         // Allow localhost peers in DHT routing for test environments
         // This prevents diversity filters from excluding peers on 127.0.0.1

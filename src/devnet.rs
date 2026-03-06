@@ -14,7 +14,7 @@ use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
-use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
+use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -291,8 +291,8 @@ pub enum NodeState {
 #[allow(dead_code)]
 pub struct DevnetNode {
     index: usize,
-    node_id: String,
-    peer_id: String,
+    label: String,
+    peer_id: PeerId,
     port: u16,
     address: SocketAddr,
     data_dir: PathBuf,
@@ -531,9 +531,13 @@ impl Devnet {
         // Generate identity first so we can use peer_id as the directory name
         let identity = NodeIdentity::generate()
             .map_err(|e| DevnetError::Core(format!("Failed to generate node identity: {e}")))?;
-        let peer_id = identity.peer_id().to_hex();
-        let node_id = format!("devnet_node_{index}");
-        let data_dir = self.config.data_dir.join(NODES_SUBDIR).join(&peer_id);
+        let peer_id = *identity.peer_id();
+        let label = format!("devnet_node_{index}");
+        let data_dir = self
+            .config
+            .data_dir
+            .join(NODES_SUBDIR)
+            .join(peer_id.to_hex());
 
         tokio::fs::create_dir_all(&data_dir).await?;
 
@@ -546,7 +550,7 @@ impl Devnet {
 
         Ok(DevnetNode {
             index,
-            node_id,
+            label,
             peer_id,
             port,
             address,
@@ -620,6 +624,14 @@ impl Devnet {
         let mut core_config = CoreNodeConfig::new()
             .map_err(|e| DevnetError::Core(format!("Failed to create core config: {e}")))?;
 
+        // Load the node identity for app-level message signing
+        let identity = NodeIdentity::load_from_file(
+            &node.data_dir.join(crate::config::NODE_IDENTITY_FILENAME),
+        )
+        .await
+        .map_err(|e| DevnetError::Core(format!("Failed to load node identity: {e}")))?;
+
+        core_config.node_identity = Some(Arc::new(identity));
         core_config.listen_addr = node.address;
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false;
