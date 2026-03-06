@@ -96,8 +96,25 @@ impl AutoApplyUpgrader {
     ///
     /// Returns an error if the binary path cannot be determined.
     pub fn current_binary_path() -> Result<PathBuf> {
-        let path =
-            env::current_exe().map_err(|e| Error::Upgrade(format!("Cannot determine binary path: {e}")))?;
+        // Prefer the invoked path (argv[0]) if it exists, as it preserves symlinks.
+        // Fall back to current_exe() which resolves symlinks via /proc/self/exe.
+        let invoked_path = env::args().next().map(PathBuf::from);
+
+        if let Some(ref invoked) = invoked_path {
+            if invoked.exists() {
+                let path_str = invoked.to_string_lossy();
+                if path_str.ends_with(" (deleted)") {
+                    let cleaned = path_str.trim_end_matches(" (deleted)");
+                    debug!("Stripped '(deleted)' suffix from invoked path: {cleaned}");
+                    return Ok(PathBuf::from(cleaned));
+                }
+                return Ok(invoked.clone());
+            }
+        }
+
+        // Fall back to current_exe (resolves symlinks on Linux)
+        let path = env::current_exe()
+            .map_err(|e| Error::Upgrade(format!("Cannot determine binary path: {e}")))?;
 
         #[cfg(unix)]
         {
@@ -189,6 +206,21 @@ impl AutoApplyUpgrader {
             return Ok(UpgradeResult::RolledBack {
                 reason: "Download/verify/extract failed (see earlier logs)".to_string(),
             });
+        }
+
+        // Check if the on-disk binary has already been upgraded by a sibling service.
+        // This prevents redundant backup/replace cycles when multiple nodes share one binary.
+        if let Some(disk_version) = on_disk_version(&current_binary) {
+            if disk_version == info.version {
+                info!(
+                    "Binary already upgraded to {} by another service, skipping replacement",
+                    info.version
+                );
+                self.trigger_restart(&current_binary)?;
+                return Ok(UpgradeResult::Success {
+                    version: info.version.clone(),
+                });
+            }
         }
 
         // Step 5: Create backup of current binary
@@ -401,7 +433,7 @@ impl AutoApplyUpgrader {
         #[cfg(windows)]
         {
             let _ = target; // target is the current exe — self_replace handles it
-            // Retry with back-off: Windows file locks may delay replacement
+                            // Retry with back-off: Windows file locks may delay replacement
             let delays = [500, 1000, 2000];
             let mut last_err = None;
             for (attempt, delay_ms) in delays.iter().enumerate() {
@@ -447,6 +479,7 @@ impl AutoApplyUpgrader {
             #[cfg(unix)]
             {
                 info!("Exiting with code 0 for service manager restart");
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 std::process::exit(0);
             }
 
@@ -457,6 +490,7 @@ impl AutoApplyUpgrader {
                     "Exiting with code {} to signal service manager restart",
                     RESTART_EXIT_CODE
                 );
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 std::process::exit(RESTART_EXIT_CODE);
             }
 
@@ -470,11 +504,7 @@ impl AutoApplyUpgrader {
             // Standalone mode: spawn new process then exit
             let args: Vec<String> = env::args().skip(1).collect();
 
-            info!(
-                "Spawning new process: {} {:?}",
-                binary_path.display(),
-                args
-            );
+            info!("Spawning new process: {} {:?}", binary_path.display(), args);
 
             std::process::Command::new(binary_path)
                 .args(&args)
@@ -482,14 +512,27 @@ impl AutoApplyUpgrader {
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit())
                 .spawn()
-                .map_err(|e| {
-                    Error::Upgrade(format!("Failed to spawn new binary: {e}"))
-                })?;
+                .map_err(|e| Error::Upgrade(format!("Failed to spawn new binary: {e}")))?;
 
             info!("New process spawned, exiting old process");
+            std::thread::sleep(std::time::Duration::from_millis(100));
             std::process::exit(0);
         }
     }
+}
+
+/// Run the on-disk binary with `--version` and parse the reported version.
+///
+/// Returns `None` if the binary cannot be executed or the output cannot be parsed.
+/// Output format is expected to be "saorsa-node X.Y.Z" or "saorsa-node X.Y.Z-rc.N".
+fn on_disk_version(binary_path: &Path) -> Option<Version> {
+    let output = std::process::Command::new(binary_path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version_str = stdout.trim().strip_prefix("saorsa-node ")?;
+    Version::parse(version_str).ok()
 }
 
 impl Default for AutoApplyUpgrader {
