@@ -30,6 +30,103 @@ use xor_name::XorName;
 /// Maximum number of concurrent chunk uploads.
 const UPLOAD_CONCURRENCY: usize = 4;
 
+/// Size of the read buffer used when streaming file data into the encryptor.
+const READ_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Shared error capture used by `open_encrypt_stream`.
+type ReadErrorCapture = Arc<Mutex<Option<std::io::Error>>>;
+
+/// Open a file and produce a streaming encryption iterator.
+///
+/// Returns the encrypted-chunk stream and an error capture that should be
+/// checked after iteration completes.
+#[allow(clippy::type_complexity)]
+fn open_encrypt_stream(
+    file_path: &Path,
+    file_size: usize,
+) -> Result<(
+    self_encryption::EncryptionStream<impl Iterator<Item = Bytes>>,
+    ReadErrorCapture,
+)> {
+    let file = std::fs::File::open(file_path).map_err(Error::Io)?;
+    let mut reader = BufReader::new(file);
+    let read_error: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
+    let read_error_writer = Arc::clone(&read_error);
+    let mut buf = vec![0u8; READ_BUFFER_SIZE];
+    let data_iter = std::iter::from_fn(move || match reader.read(&mut buf) {
+        Ok(0) => None,
+        Err(e) => {
+            if let Ok(mut guard) = read_error_writer.lock() {
+                *guard = Some(e);
+            }
+            None
+        }
+        Ok(n) => Some(Bytes::copy_from_slice(&buf[..n])),
+    });
+
+    // NOTE: Chunk size headroom for encryption overhead is managed by the
+    // self_encryption crate itself. See self_encryption::MAX_CHUNK_SIZE.
+    let stream = self_encryption::stream_encrypt(file_size, data_iter)
+        .map_err(|e| Error::Crypto(format!("Self-encryption failed: {e}")))?;
+
+    Ok((stream, read_error))
+}
+
+/// Check whether the read-error capture from `open_encrypt_stream` recorded
+/// an I/O error during iteration.
+fn check_read_error(read_error: &ReadErrorCapture) -> Result<()> {
+    if let Ok(guard) = read_error.lock() {
+        if let Some(ref e) = *guard {
+            return Err(Error::Io(std::io::Error::new(e.kind(), format!("{e}"))));
+        }
+    }
+    Ok(())
+}
+
+/// Write a stream of decrypted chunks to a file atomically.
+///
+/// Writes to a temporary file first, then renames on success.
+/// Cleans up the temp file on error.
+fn write_stream_to_file(
+    stream: impl Iterator<Item = std::result::Result<Bytes, self_encryption::Error>>,
+    output_path: &Path,
+) -> Result<()> {
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let unique: u64 = rand::random();
+    let tmp_path = parent.join(format!(
+        ".saorsa_decrypt_{}_{unique}.tmp",
+        std::process::id()
+    ));
+
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&tmp_path).map_err(Error::Io)?;
+        for chunk_result in stream {
+            let chunk_bytes =
+                chunk_result.map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
+            file.write_all(&chunk_bytes).map_err(Error::Io)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
+            warn!(
+                "Failed to remove temp file {}: {cleanup_err}",
+                tmp_path.display()
+            );
+        }
+        return Err(e);
+    }
+
+    // On Windows, rename fails if destination exists. Remove it first.
+    if output_path.exists() {
+        std::fs::remove_file(output_path).map_err(Error::Io)?;
+    }
+    std::fs::rename(&tmp_path, output_path).map_err(Error::Io)?;
+
+    Ok(())
+}
+
 /// Encrypt a file using streaming self-encryption and upload chunks concurrently.
 ///
 /// Chunks are streamed lazily from the encryption iterator and uploaded with
@@ -57,32 +154,11 @@ pub async fn encrypt_and_upload_file(
         file_path.display()
     );
 
-    let file = std::fs::File::open(file_path).map_err(Error::Io)?;
-    let mut reader = BufReader::new(file);
-    let read_error: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
-    let read_error_writer = Arc::clone(&read_error);
-    let data_iter = std::iter::from_fn(move || {
-        let mut buf = vec![0u8; 65536];
-        match reader.read(&mut buf) {
-            Ok(0) => None,
-            Err(e) => {
-                if let Ok(mut guard) = read_error_writer.lock() {
-                    *guard = Some(e);
-                }
-                None
-            }
-            Ok(n) => {
-                buf.truncate(n);
-                Some(Bytes::from(buf))
-            }
-        }
-    });
-
-    let mut stream = self_encryption::stream_encrypt(file_size, data_iter)
-        .map_err(|e| Error::Crypto(format!("Self-encryption failed: {e}")))?;
+    let (mut stream, read_error) = open_encrypt_stream(file_path, file_size)?;
 
     let mut all_tx_hashes: Vec<String> = Vec::new();
     let mut chunk_num: usize = 0;
+    let mut uploaded_chunks: usize = 0;
 
     {
         let mut in_flight = FuturesUnordered::new();
@@ -122,18 +198,20 @@ pub async fn encrypt_and_upload_file(
                 .ok_or_else(|| Error::Crypto("Upload stream unexpectedly empty".into()))?;
             match result {
                 Ok((address, tx_hashes)) => {
+                    // Always capture tx hashes, even on mismatch
+                    all_tx_hashes.extend(tx_hashes.iter().map(|tx| format!("{tx:?}")));
+                    uploaded_chunks += 1;
                     if address != hash.0 {
                         // Drain remaining in-flight futures before returning
-                        let mut succeeded = all_tx_hashes.len();
                         while let Some((_, _, res)) = in_flight.next().await {
                             if let Ok((_, txs)) = res {
                                 all_tx_hashes.extend(txs.iter().map(|tx| format!("{tx:?}")));
-                                succeeded += 1;
+                                uploaded_chunks += 1;
                             }
                         }
-                        if succeeded > 0 {
+                        if uploaded_chunks > 0 {
                             warn!(
-                                "{succeeded} chunk(s) already uploaded before hash mismatch on chunk {num}; \
+                                "{uploaded_chunks} chunk(s) already uploaded before hash mismatch on chunk {num}; \
                                  tx_hashes so far: {all_tx_hashes:?}"
                             );
                         }
@@ -143,20 +221,18 @@ pub async fn encrypt_and_upload_file(
                             hex::encode(address)
                         )));
                     }
-                    all_tx_hashes.extend(tx_hashes.iter().map(|tx| format!("{tx:?}")));
                 }
                 Err(e) => {
                     // Drain remaining in-flight futures so we don't lose paid chunks
-                    let mut succeeded = all_tx_hashes.len();
                     while let Some((_, _, res)) = in_flight.next().await {
                         if let Ok((_, txs)) = res {
                             all_tx_hashes.extend(txs.iter().map(|tx| format!("{tx:?}")));
-                            succeeded += 1;
+                            uploaded_chunks += 1;
                         }
                     }
-                    if succeeded > 0 {
+                    if uploaded_chunks > 0 {
                         warn!(
-                            "{succeeded} chunk(s) already uploaded successfully before failure on chunk {num}; \
+                            "{uploaded_chunks} chunk(s) already uploaded successfully before failure on chunk {num}; \
                              tx_hashes so far: {all_tx_hashes:?}"
                         );
                     }
@@ -166,12 +242,7 @@ pub async fn encrypt_and_upload_file(
         }
     }
 
-    // Check if the data iterator encountered an I/O error during chunk iteration
-    if let Ok(guard) = read_error.lock() {
-        if let Some(ref e) = *guard {
-            return Err(Error::Io(std::io::Error::new(e.kind(), format!("{e}"))));
-        }
-    }
+    check_read_error(&read_error)?;
 
     let data_map = stream
         .into_datamap()
@@ -187,29 +258,7 @@ fn encrypt_file_to_chunks(
     file_path: &Path,
     file_size: usize,
 ) -> Result<(DataMap, Vec<(XorName, Bytes)>)> {
-    let file = std::fs::File::open(file_path).map_err(Error::Io)?;
-    let mut reader = BufReader::new(file);
-    let read_error: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
-    let read_error_writer = Arc::clone(&read_error);
-    let data_iter = std::iter::from_fn(move || {
-        let mut buf = vec![0u8; 65536];
-        match reader.read(&mut buf) {
-            Ok(0) => None,
-            Err(e) => {
-                if let Ok(mut guard) = read_error_writer.lock() {
-                    *guard = Some(e);
-                }
-                None
-            }
-            Ok(n) => {
-                buf.truncate(n);
-                Some(Bytes::from(buf))
-            }
-        }
-    });
-
-    let mut stream = self_encryption::stream_encrypt(file_size, data_iter)
-        .map_err(|e| Error::Crypto(format!("Self-encryption failed: {e}")))?;
+    let (mut stream, read_error) = open_encrypt_stream(file_path, file_size)?;
 
     let mut chunks = Vec::new();
     for chunk_result in stream.chunks() {
@@ -218,12 +267,7 @@ fn encrypt_file_to_chunks(
         chunks.push((hash, content));
     }
 
-    // Check if the data iterator encountered an I/O error during chunk iteration
-    if let Ok(guard) = read_error.lock() {
-        if let Some(ref e) = *guard {
-            return Err(Error::Io(std::io::Error::new(e.kind(), format!("{e}"))));
-        }
-    }
+    check_read_error(&read_error)?;
 
     let data_map = stream
         .into_datamap()
@@ -303,36 +347,7 @@ pub async fn download_and_decrypt_file(
     })
     .map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
 
-    // Write to a temp file first, then rename atomically on success
-    // to prevent leaving a corrupt partial file on failure.
-    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-    let unique: u64 = rand::random();
-    let tmp_path = parent.join(format!(
-        ".saorsa_decrypt_{}_{unique}.tmp",
-        std::process::id()
-    ));
-
-    let result = (|| -> Result<()> {
-        let mut file = std::fs::File::create(&tmp_path).map_err(Error::Io)?;
-        for chunk_result in stream {
-            let chunk_bytes =
-                chunk_result.map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
-            file.write_all(&chunk_bytes).map_err(Error::Io)?;
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = result {
-        if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
-            warn!(
-                "Failed to remove temp file {}: {cleanup_err}",
-                tmp_path.display()
-            );
-        }
-        return Err(e);
-    }
-
-    std::fs::rename(&tmp_path, output_path).map_err(Error::Io)?;
+    write_stream_to_file(stream, output_path)?;
 
     info!("Decryption complete: {}", output_path.display());
     Ok(())
@@ -450,36 +465,7 @@ fn decrypt_from_store<S: BuildHasher>(
     })
     .map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
 
-    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-    let unique: u64 = rand::random();
-    let tmp_path = parent.join(format!(
-        ".saorsa_decrypt_{}_{unique}.tmp",
-        std::process::id()
-    ));
-
-    let result = (|| -> Result<()> {
-        let mut file = std::fs::File::create(&tmp_path).map_err(Error::Io)?;
-        for chunk_result in stream {
-            let chunk_bytes =
-                chunk_result.map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
-            file.write_all(&chunk_bytes).map_err(Error::Io)?;
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = result {
-        if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
-            warn!(
-                "Failed to remove temp file {}: {cleanup_err}",
-                tmp_path.display()
-            );
-        }
-        return Err(e);
-    }
-
-    std::fs::rename(&tmp_path, output_path).map_err(Error::Io)?;
-
-    Ok(())
+    write_stream_to_file(stream, output_path)
 }
 
 #[cfg(test)]
