@@ -59,7 +59,7 @@ async fn main() -> color_eyre::Result<()> {
     }
 
     let (bootstrap, manifest) = resolve_bootstrap(&cli)?;
-    let node = create_client_node(bootstrap).await?;
+    let node = create_client_node(bootstrap, cli.allow_loopback).await?;
 
     // Build client with timeout
     let mut client = QuantumClient::new(QuantumConfig {
@@ -329,7 +329,10 @@ fn resolve_bootstrap(
     ))
 }
 
-async fn create_client_node(bootstrap: Vec<std::net::SocketAddr>) -> Result<Arc<P2PNode>, Error> {
+async fn create_client_node(
+    bootstrap: Vec<std::net::SocketAddr>,
+    allow_loopback: bool,
+) -> Result<Arc<P2PNode>, Error> {
     let mut core_config = saorsa_core::NodeConfig::new()
         .map_err(|e| Error::Config(format!("Failed to create core config: {e}")))?;
     core_config.listen_addr = "0.0.0.0:0"
@@ -340,6 +343,7 @@ async fn create_client_node(bootstrap: Vec<std::net::SocketAddr>) -> Result<Arc<
     core_config.bootstrap_peers = bootstrap.iter().map(Into::into).collect();
     core_config.max_message_size = Some(MAX_WIRE_MESSAGE_SIZE);
     core_config.mode = saorsa_core::NodeMode::Client;
+    core_config.allow_loopback = allow_loopback;
 
     let node = P2PNode::new(core_config)
         .await

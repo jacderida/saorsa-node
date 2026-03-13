@@ -21,6 +21,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 60)]
     pub timeout_secs: u64,
 
+    /// Allow loopback connections (required for devnet/local testing).
+    #[arg(long)]
+    pub allow_loopback: bool,
+
     /// Log level.
     #[arg(long, default_value = "info")]
     pub log_level: String,
