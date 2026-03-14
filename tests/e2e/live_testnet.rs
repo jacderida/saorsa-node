@@ -13,7 +13,7 @@
     clippy::too_many_lines
 )]
 
-use saorsa_core::{NodeConfig as CoreNodeConfig, P2PNode};
+use saorsa_core::{MultiAddr, NodeConfig as CoreNodeConfig, P2PNode};
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -42,7 +42,10 @@ async fn create_testnet_client() -> P2PNode {
     println!("Connecting to testnet via: {bootstrap_addrs:?}");
 
     let mut config = CoreNodeConfig::new().expect("Failed to create config");
-    config.bootstrap_peers = bootstrap_addrs.iter().map(Into::into).collect();
+    config.bootstrap_peers = bootstrap_addrs
+        .iter()
+        .map(|addr| MultiAddr::quic(*addr))
+        .collect();
 
     // Use a random port for the client
     config.listen_addr = "127.0.0.1:0".parse().unwrap();

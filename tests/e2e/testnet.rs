@@ -21,8 +21,8 @@ use futures::future::join_all;
 use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::{
-    identity::NodeIdentity, IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig,
-    P2PEvent, P2PNode,
+    identity::NodeIdentity, IPDiversityConfig as CoreDiversityConfig, MultiAddr,
+    NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
 };
 use saorsa_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
@@ -384,7 +384,7 @@ pub struct TestNode {
     pub state: Arc<RwLock<NodeState>>,
 
     /// Bootstrap addresses this node connects to.
-    pub bootstrap_addrs: Vec<SocketAddr>,
+    pub bootstrap_addrs: Vec<MultiAddr>,
 
     /// ML-DSA-65 identity used for quote signing.
     ///
@@ -1109,12 +1109,12 @@ impl TestNetwork {
         let regular_count = self.config.node_count - self.config.bootstrap_count;
         info!("Starting {} regular nodes", regular_count);
 
-        let bootstrap_addrs: Vec<SocketAddr> = self
+        let bootstrap_addrs: Vec<MultiAddr> = self
             .nodes
             .get(0..self.config.bootstrap_count)
             .unwrap_or_default()
             .iter()
-            .map(|n| n.address)
+            .map(|n| MultiAddr::quic(n.address))
             .collect();
 
         for i in self.config.bootstrap_count..self.config.node_count {
@@ -1139,7 +1139,7 @@ impl TestNetwork {
         &self,
         index: usize,
         is_bootstrap: bool,
-        bootstrap_addrs: Vec<SocketAddr>,
+        bootstrap_addrs: Vec<MultiAddr>,
     ) -> Result<TestNode> {
         // Safe: node_count is validated in TestNetwork::new() to fit in u16
         let index_u16 = u16::try_from(index)
@@ -1277,7 +1277,7 @@ impl TestNetwork {
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false; // Disable IPv6 for local testing to avoid dual-stack binding issues
         core_config.connection_timeout = Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS);
-        core_config.bootstrap_peers = node.bootstrap_addrs.iter().map(Into::into).collect();
+        core_config.bootstrap_peers = node.bootstrap_addrs.clone();
         // Override the transport-layer message size to accommodate max-size
         // chunks (4 MiB payload + serialization overhead = 5 MiB wire).
         core_config.max_message_size = Some(saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE);

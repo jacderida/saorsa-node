@@ -14,7 +14,9 @@ use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
-use saorsa_core::{IPDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId};
+use saorsa_core::{
+    IPDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId,
+};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -228,7 +230,7 @@ pub struct DevnetManifest {
     /// Node count.
     pub node_count: usize,
     /// Bootstrap addresses.
-    pub bootstrap: Vec<SocketAddr>,
+    pub bootstrap: Vec<MultiAddr>,
     /// Data directory.
     pub data_dir: PathBuf,
     /// Creation time in RFC3339.
@@ -300,7 +302,7 @@ pub struct DevnetNode {
     ant_protocol: Option<Arc<AntProtocol>>,
     is_bootstrap: bool,
     state: Arc<RwLock<NodeState>>,
-    bootstrap_addrs: Vec<SocketAddr>,
+    bootstrap_addrs: Vec<MultiAddr>,
     protocol_task: Option<JoinHandle<()>>,
 }
 
@@ -465,11 +467,11 @@ impl Devnet {
 
     /// Get bootstrap addresses.
     #[must_use]
-    pub fn bootstrap_addrs(&self) -> Vec<SocketAddr> {
+    pub fn bootstrap_addrs(&self) -> Vec<MultiAddr> {
         self.nodes
             .iter()
             .take(self.config.bootstrap_count)
-            .map(|n| n.address)
+            .map(|n| MultiAddr::quic(n.address))
             .collect()
     }
 
@@ -493,7 +495,7 @@ impl Devnet {
         let regular_count = self.config.node_count - self.config.bootstrap_count;
         info!("Starting {} regular nodes", regular_count);
 
-        let bootstrap_addrs: Vec<SocketAddr> = self
+        let bootstrap_addrs: Vec<MultiAddr> = self
             .nodes
             .get(0..self.config.bootstrap_count)
             .ok_or_else(|| {
@@ -504,7 +506,7 @@ impl Devnet {
                 ))
             })?
             .iter()
-            .map(|n| n.address)
+            .map(|n| MultiAddr::quic(n.address))
             .collect();
 
         for i in self.config.bootstrap_count..self.config.node_count {
@@ -521,7 +523,7 @@ impl Devnet {
         &self,
         index: usize,
         is_bootstrap: bool,
-        bootstrap_addrs: Vec<SocketAddr>,
+        bootstrap_addrs: Vec<MultiAddr>,
     ) -> Result<DevnetNode> {
         let index_u16 = u16::try_from(index)
             .map_err(|_| DevnetError::Config(format!("Node index {index} exceeds u16::MAX")))?;
@@ -635,7 +637,7 @@ impl Devnet {
         core_config.listen_addr = node.address;
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false;
-        core_config.bootstrap_peers = node.bootstrap_addrs.iter().map(Into::into).collect();
+        core_config.bootstrap_peers = node.bootstrap_addrs.clone();
         core_config.max_message_size = Some(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
         // Devnet nodes all run on 127.0.0.1.

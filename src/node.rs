@@ -17,8 +17,8 @@ use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
-    IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
-    ProductionConfig as CoreProductionConfig,
+    IPDiversityConfig as CoreDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent,
+    P2PNode, ProductionConfig as CoreProductionConfig,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -194,7 +194,11 @@ impl NodeBuilder {
         core_config.enable_ipv6 = matches!(config.ip_version, IpVersion::Ipv6 | IpVersion::Dual);
 
         // Add bootstrap peers.
-        core_config.bootstrap_peers = config.bootstrap.iter().map(Into::into).collect();
+        core_config.bootstrap_peers = config
+            .bootstrap
+            .iter()
+            .map(|addr| MultiAddr::quic(*addr))
+            .collect();
 
         // Forward max_message_size to the transport layer.
         core_config.max_message_size = Some(config.max_message_size);
