@@ -9,8 +9,6 @@ use crate::payment::proof::deserialize_proof;
 use crate::payment::quote::{verify_quote_content, verify_quote_signature};
 use crate::payment::single_node::REQUIRED_QUOTES;
 use ant_evm::{ProofOfPayment, RewardsAddress};
-use evmlib::contract::payment_vault::error::Error as PaymentVaultError;
-use evmlib::contract::payment_vault::verify_data_payment;
 use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
 use std::time::SystemTime;
@@ -312,31 +310,60 @@ impl PaymentVerifier {
         .await
         .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))??;
 
-        // Verify on-chain payment
+        // Verify on-chain payment.
+        //
+        // The SingleNode payment model pays only the median-priced quote (3x)
+        // and sends Amount::ZERO for the other 4. evmlib's pay_for_quotes()
+        // filters out zero-amount payments, so only 1 quote has an on-chain
+        // record. The contract's verifyPayment() returns isValid=false for
+        // unpaid quotes, which is expected — we only require that at least
+        // one result is valid (the paid quote).
         let payment_digest = payment.digest();
         if payment_digest.is_empty() {
             return Err(Error::Payment("Payment has no quotes".to_string()));
         }
 
-        let owned_quote_hashes = vec![];
-        match verify_data_payment(&self.config.evm.network, owned_quote_hashes, payment_digest)
+        let payment_verifications: Vec<_> = payment_digest
+            .into_iter()
+            .map(
+                evmlib::contract::payment_vault::interface::IPaymentVault::PaymentVerification::from,
+            )
+            .collect();
+
+        let provider =
+            evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
+        let handler = evmlib::contract::payment_vault::handler::PaymentVaultHandler::new(
+            *self.config.evm.network.data_payments_address(),
+            provider,
+        );
+
+        let results = handler
+            .verify_payment(payment_verifications)
             .await
-        {
-            Ok(_amount) => {
-                if tracing::enabled!(tracing::Level::INFO) {
-                    info!("EVM payment verified for {}", hex::encode(xorname));
-                }
-                Ok(())
-            }
-            Err(PaymentVaultError::PaymentInvalid) => Err(Error::Payment(format!(
-                "Payment verification failed on-chain for {}",
+            .map_err(|e| {
+                Error::Payment(format!(
+                    "EVM verification error for {}: {e}",
+                    hex::encode(xorname)
+                ))
+            })?;
+
+        let any_valid = results.iter().any(|r| r.isValid);
+        if !any_valid {
+            return Err(Error::Payment(format!(
+                "Payment verification failed on-chain for {} (no valid payments found)",
                 hex::encode(xorname)
-            ))),
-            Err(e) => Err(Error::Payment(format!(
-                "EVM verification error for {}: {e}",
-                hex::encode(xorname)
-            ))),
+            )));
         }
+
+        if tracing::enabled!(tracing::Level::INFO) {
+            let valid_count = results.iter().filter(|r| r.isValid).count();
+            info!(
+                "EVM payment verified for {} ({valid_count}/{} quotes paid)",
+                hex::encode(xorname),
+                results.len()
+            );
+        }
+        Ok(())
     }
 
     /// Validate quote count, uniqueness, and basic structure.
