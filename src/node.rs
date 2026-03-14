@@ -18,7 +18,7 @@ use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
     IPDiversityConfig as CoreDiversityConfig, ListenMode, MultiAddr, NodeConfig as CoreNodeConfig,
-    P2PEvent, P2PNode, ProductionConfig as CoreProductionConfig,
+    P2PEvent, P2PNode,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -195,13 +195,9 @@ impl NodeBuilder {
         // Propagate network-mode tuning into saorsa-core where supported.
         match config.network_mode {
             NetworkMode::Production => {
-                core_config.production_config = Some(CoreProductionConfig::default());
                 core_config.diversity_config = Some(CoreDiversityConfig::default());
             }
             NetworkMode::Testnet => {
-                // Testnet allows loopback so nodes can be co-located.
-                core_config.allow_loopback = true;
-                core_config.production_config = Some(CoreProductionConfig::default());
                 let mut diversity = CoreDiversityConfig::testnet();
                 diversity.max_nodes_per_asn = config.testnet.max_nodes_per_asn;
                 diversity.max_nodes_per_64 = config.testnet.max_nodes_per_64;
@@ -221,8 +217,6 @@ impl NodeBuilder {
                 }
             }
             NetworkMode::Development => {
-                // ListenMode::Local already set allow_loopback via the builder.
-                core_config.production_config = None;
                 core_config.diversity_config = Some(CoreDiversityConfig::permissive());
             }
         }
@@ -561,17 +555,11 @@ impl RunningNode {
 
         // Log bootstrap cache stats before shutdown
         if let Some(ref manager) = self.bootstrap_manager {
-            match manager.get_stats().await {
-                Ok(stats) => {
-                    info!(
-                        "Bootstrap cache shutdown: {} contacts, avg quality {:.2}",
-                        stats.total_contacts, stats.average_quality_score
-                    );
-                }
-                Err(e) => {
-                    debug!("Failed to get bootstrap cache stats: {e}");
-                }
-            }
+            let stats = manager.stats().await;
+            info!(
+                "Bootstrap cache shutdown: {} peers, avg quality {:.2}",
+                stats.total_peers, stats.average_quality
+            );
         }
 
         // Stop protocol routing task
@@ -744,7 +732,6 @@ mod tests {
             ..Default::default()
         };
         let core = NodeBuilder::build_core_config(&config).expect("core config");
-        assert!(core.production_config.is_some());
         assert!(core.diversity_config.is_some());
     }
 
@@ -755,7 +742,6 @@ mod tests {
             ..Default::default()
         };
         let core = NodeBuilder::build_core_config(&config).expect("core config");
-        assert!(core.production_config.is_none());
         let diversity = core.diversity_config.expect("diversity");
         assert!(diversity.is_relaxed());
     }
