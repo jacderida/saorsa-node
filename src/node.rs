@@ -607,7 +607,9 @@ impl RunningNode {
 
         // Subscribe to metric events before starting the P2P node so we
         // don't miss connection/handshake events emitted during startup.
-        self.start_metric_event_loop();
+        if self.config.metrics_port != 0 {
+            self.start_metric_event_loop();
+        }
 
         // Start the P2P node
         self.p2p_node
@@ -825,6 +827,8 @@ impl RunningNode {
                 }
             };
 
+            info!("Metrics server listening on {metrics_addr}");
+
             let server = axum::serve(listener, app).with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             });
@@ -833,8 +837,6 @@ impl RunningNode {
                 error!("Metrics server error: {e}");
             }
         }));
-
-        info!("Metrics server listening on {metrics_addr}");
     }
 
     /// Start the protocol message routing background task.
@@ -963,7 +965,7 @@ async fn health_handler(
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "application/json")],
-            format!("{{\"error\":\"{e}\"}}"),
+            serde_json::json!({"error": e.to_string()}).to_string(),
         ),
     }
 }
@@ -985,7 +987,7 @@ async fn ready_handler(
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "application/json")],
-            format!("{{\"error\":\"{e}\"}}"),
+            serde_json::json!({"error": e.to_string()}).to_string(),
         ),
     }
 }
@@ -1038,7 +1040,7 @@ async fn debug_handler(
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "application/json")],
-            format!("{{\"error\":\"{e}\"}}"),
+            serde_json::json!({"error": e.to_string()}).to_string(),
         ),
     }
 }

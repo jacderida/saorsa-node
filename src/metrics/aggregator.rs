@@ -14,8 +14,36 @@ use tokio::sync::RwLock;
 /// Maximum number of samples retained in each sliding window.
 const WINDOW_SIZE: usize = 1000;
 
+/// Convert a `Duration` to microseconds clamped to `u64::MAX`.
+fn duration_to_micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Integer-to-float ratio. Precision loss above 2^52 is acceptable for metrics.
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    #[expect(clippy::cast_precision_loss)]
+    let num = numerator as f64;
+    #[expect(clippy::cast_precision_loss)]
+    let den = denominator as f64;
+    num / den
+}
+
+/// Compute the index into a sorted slice for the given percentile `p` (0--100).
+fn percentile_index(len: usize, p: f64) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    #[expect(clippy::cast_precision_loss)]
+    let len_f = (len - 1) as f64;
+    let raw = (p / 100.0 * len_f).round().max(0.0).min(len_f);
+    // `raw` is in [0, len-1] which always fits in usize.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let idx = raw as usize;
+    idx
+}
+
 /// Counters for a single storage operation type (read / write / delete).
-pub(crate) struct OperationCounter {
+pub struct OperationCounter {
     pub total: AtomicU64,
     pub errors: AtomicU64,
     pub durations: RwLock<VecDeque<u64>>,
@@ -35,13 +63,32 @@ impl OperationCounter {
         if !success {
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
-        let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+        let micros = duration_to_micros(duration);
         let mut window = self.durations.write().await;
         if window.len() >= WINDOW_SIZE {
             window.pop_front();
         }
         window.push_back(micros);
     }
+}
+
+/// Push a sample into a keyed map of bounded sliding windows.
+///
+/// The write guard must stay alive while we mutate the inner `VecDeque`.
+#[expect(clippy::significant_drop_tightening)]
+async fn push_map_window(
+    map_lock: &RwLock<HashMap<StreamClass, VecDeque<u64>>>,
+    key: StreamClass,
+    value: u64,
+) {
+    let mut map = map_lock.write().await;
+    let window = map
+        .entry(key)
+        .or_insert_with(|| VecDeque::with_capacity(WINDOW_SIZE));
+    if window.len() >= WINDOW_SIZE {
+        window.pop_front();
+    }
+    window.push_back(value);
 }
 
 /// Push a microsecond sample into a bounded sliding window.
@@ -158,7 +205,7 @@ impl MetricsAggregator {
         match event {
             MetricEvent::LookupCompleted { duration, hops } => {
                 self.lookup_count.fetch_add(1, Ordering::Relaxed);
-                let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+                let micros = duration_to_micros(duration);
                 push_window(&self.lookup_latencies, micros).await;
                 {
                     let mut w = self.lookup_hops.write().await;
@@ -177,7 +224,7 @@ impl MetricsAggregator {
                 if success {
                     self.dht_puts_success.fetch_add(1, Ordering::Relaxed);
                 }
-                let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+                let micros = duration_to_micros(duration);
                 push_window(&self.dht_put_latencies, micros).await;
             }
             MetricEvent::DhtGetCompleted { duration, success } => {
@@ -185,7 +232,7 @@ impl MetricsAggregator {
                 if success {
                     self.dht_gets_success.fetch_add(1, Ordering::Relaxed);
                 }
-                let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+                let micros = duration_to_micros(duration);
                 push_window(&self.dht_get_latencies, micros).await;
             }
             MetricEvent::AuthFailure => {
@@ -195,31 +242,13 @@ impl MetricsAggregator {
                 class,
                 bytes_per_sec,
             } => {
-                let mut map = self.stream_bandwidth.write().await;
-                let window = map
-                    .entry(class)
-                    .or_insert_with(|| VecDeque::with_capacity(WINDOW_SIZE));
-                if window.len() >= WINDOW_SIZE {
-                    window.pop_front();
-                }
-                window.push_back(bytes_per_sec);
+                self.record_stream_bandwidth(class, bytes_per_sec).await;
             }
             MetricEvent::StreamRtt { class, rtt } => {
-                let micros = rtt.as_micros().min(u128::from(u64::MAX)) as u64;
-                let mut map = self.stream_rtt.write().await;
-                let window = map
-                    .entry(class)
-                    .or_insert_with(|| VecDeque::with_capacity(WINDOW_SIZE));
-                if window.len() >= WINDOW_SIZE {
-                    window.pop_front();
-                }
-                window.push_back(micros);
+                self.record_stream_rtt(class, rtt).await;
             }
             // --- Phase 2: Transport ---
-            MetricEvent::ConnectionEstablished { .. } => {
-                // Connection counts are tracked in TransportStats (pull-based).
-                // No additional event-driven aggregation needed here.
-            }
+            MetricEvent::ConnectionEstablished { .. } | MetricEvent::ConnectionLost { .. } => {}
             MetricEvent::ConnectionFailed { reason } => {
                 let key = format!("{reason:?}");
                 let mut map = self.connection_failures_by_reason.write().await;
@@ -227,13 +256,9 @@ impl MetricsAggregator {
             }
             MetricEvent::HandshakeCompleted { duration } => {
                 if let Some(d) = duration {
-                    let micros = d.as_micros().min(u128::from(u64::MAX)) as u64;
+                    let micros = duration_to_micros(d);
                     push_window(&self.handshake_latencies, micros).await;
                 }
-            }
-            MetricEvent::ConnectionLost { .. } => {
-                // Connection loss is tracked via P2PEvent::PeerDisconnected (pull-based).
-                // No additional event-driven aggregation needed here.
             }
             // --- Phase 2: Replication ---
             MetricEvent::ReplicationStarted { .. } => {
@@ -245,7 +270,7 @@ impl MetricsAggregator {
                 keys_repaired,
                 bytes_transferred,
             } => {
-                let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+                let micros = duration_to_micros(duration);
                 push_window(&self.replication_durations, micros).await;
                 self.replication_keys_repaired_total
                     .fetch_add(keys_repaired, Ordering::Relaxed);
@@ -259,6 +284,17 @@ impl MetricsAggregator {
                     .fetch_add(keys_affected, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Record a stream bandwidth sample.
+    async fn record_stream_bandwidth(&self, class: StreamClass, bytes_per_sec: u64) {
+        push_map_window(&self.stream_bandwidth, class, bytes_per_sec).await;
+    }
+
+    /// Record a stream RTT sample.
+    async fn record_stream_rtt(&self, class: StreamClass, rtt: Duration) {
+        let micros = duration_to_micros(rtt);
+        push_map_window(&self.stream_rtt, class, micros).await;
     }
 
     // ---- Peer connection tracking (from P2PEvent) ----
@@ -325,7 +361,8 @@ impl MetricsAggregator {
         if total == 0 {
             return 0.0;
         }
-        self.lookup_timeouts.load(Ordering::Relaxed) as f64 / total as f64
+        let timeouts = self.lookup_timeouts.load(Ordering::Relaxed);
+        ratio(timeouts, total)
     }
 
     /// DHT success rate across all puts and gets.
@@ -337,7 +374,7 @@ impl MetricsAggregator {
         }
         let success = self.dht_puts_success.load(Ordering::Relaxed)
             + self.dht_gets_success.load(Ordering::Relaxed);
-        success as f64 / total as f64
+        ratio(success, total)
     }
 
     /// Total DHT operations per second since node start.
@@ -348,7 +385,9 @@ impl MetricsAggregator {
         if elapsed < 1.0 {
             return 0.0;
         }
-        total as f64 / elapsed
+        #[expect(clippy::cast_precision_loss)]
+        let total_f = total as f64;
+        total_f / elapsed
     }
 }
 
@@ -360,23 +399,23 @@ impl Default for MetricsAggregator {
 
 // ---- Percentile helpers ----
 
-/// Compute a percentile (0–100) from a sorted slice of u64 values.
+/// Compute a percentile (0--100) from a sorted slice of u64 values.
 /// Returns 0 if the slice is empty.
-pub(crate) fn percentile_u64(sorted: &[u64], p: f64) -> u64 {
+pub fn percentile_u64(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
-    let idx = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round().max(0.0) as usize;
+    let idx = percentile_index(sorted.len(), p);
     sorted[idx.min(sorted.len() - 1)]
 }
 
-/// Compute a percentile (0–100) from a sorted slice of u8 values.
+/// Compute a percentile (0--100) from a sorted slice of u8 values.
 /// Returns 0 if the slice is empty.
-pub(crate) fn percentile_u8(sorted: &[u8], p: f64) -> u8 {
+pub fn percentile_u8(sorted: &[u8], p: f64) -> u8 {
     if sorted.is_empty() {
         return 0;
     }
-    let idx = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round().max(0.0) as usize;
+    let idx = percentile_index(sorted.len(), p);
     sorted[idx.min(sorted.len() - 1)]
 }
 
@@ -524,10 +563,14 @@ mod tests {
         .await;
 
         let bw = agg.stream_bandwidth.read().await;
-        assert_eq!(bw.get(&StreamClass::File).map(VecDeque::len), Some(1));
+        let bw_len = bw.get(&StreamClass::File).map(VecDeque::len);
+        drop(bw);
+        assert_eq!(bw_len, Some(1));
 
         let rtt = agg.stream_rtt.read().await;
-        assert_eq!(rtt.get(&StreamClass::Control).map(VecDeque::len), Some(1));
+        let rtt_len = rtt.get(&StreamClass::Control).map(VecDeque::len);
+        drop(rtt);
+        assert_eq!(rtt_len, Some(1));
     }
 
     #[tokio::test]
@@ -576,8 +619,11 @@ mod tests {
         .await;
 
         let map = agg.connection_failures_by_reason.read().await;
-        assert_eq!(map.get("Timeout"), Some(&2));
-        assert_eq!(map.get("NatTraversalFailed"), Some(&1));
+        let timeout_count = map.get("Timeout").copied();
+        let nat_count = map.get("NatTraversalFailed").copied();
+        drop(map);
+        assert_eq!(timeout_count, Some(2));
+        assert_eq!(nat_count, Some(1));
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use saorsa_core::dht::metrics::{
 };
 use saorsa_core::identity::PeerId;
 use saorsa_core::{StrategyStats, StreamClass, TransportStats};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::atomic::Ordering;
 
@@ -43,9 +43,12 @@ impl PrometheusFormatter {
         Self::format_storage_metrics(&mut out, aggregator).await?;
         Self::format_routing_table_metrics(&mut out, &snapshot.dht_health)?;
         Self::format_replication_metrics(&mut out, &snapshot.dht_health)?;
-        Self::format_security_metrics(&mut out, &snapshot.security)?;
-        Self::format_trust_metrics(&mut out, &snapshot.trust, &snapshot.trust_scores)?;
-        Self::format_placement_metrics(&mut out, &snapshot.placement)?;
+        Self::format_security_attack_metrics(&mut out, &snapshot.security)?;
+        Self::format_security_operational_metrics(&mut out, &snapshot.security)?;
+        Self::format_trust_metrics(&mut out, &snapshot.trust)?;
+        Self::format_trust_distribution(&mut out, &snapshot.trust, snapshot.trust_scores.as_ref())?;
+        Self::format_placement_storage_metrics(&mut out, &snapshot.placement)?;
+        Self::format_placement_balance_metrics(&mut out, &snapshot.placement)?;
         Self::format_transport_metrics(&mut out, &snapshot.transport)?;
         Self::format_strategy_metrics(&mut out, &snapshot.strategy_stats)?;
 
@@ -53,7 +56,8 @@ impl PrometheusFormatter {
         Self::format_handshake_metrics(&mut out, aggregator).await?;
         Self::format_dht_latency_metrics(&mut out, aggregator).await?;
         Self::format_ops_per_second(&mut out, aggregator)?;
-        Self::format_extended_transport_metrics(&mut out, &snapshot.transport)?;
+        Self::format_transport_connection_metrics(&mut out, &snapshot.transport)?;
+        Self::format_transport_nat_metrics(&mut out, &snapshot.transport)?;
         Self::format_connection_failure_breakdown(&mut out, aggregator).await?;
         Self::format_replication_timing_metrics(&mut out, aggregator).await?;
 
@@ -83,11 +87,17 @@ impl PrometheusFormatter {
 
         // Latency percentiles
         {
-            let window = agg.lookup_latencies.read().await;
-            let mut sorted: Vec<u64> = window.iter().copied().collect();
+            let latency_data: Vec<u64> = {
+                let window = agg.lookup_latencies.read().await;
+                window.iter().copied().collect()
+            };
+            let mut sorted = latency_data;
             sorted.sort_unstable();
+            #[expect(clippy::cast_precision_loss)]
             let p50 = percentile_u64(&sorted, 50.0) as f64 / 1000.0;
+            #[expect(clippy::cast_precision_loss)]
             let p95 = percentile_u64(&sorted, 95.0) as f64 / 1000.0;
+            #[expect(clippy::cast_precision_loss)]
             let p99 = percentile_u64(&sorted, 99.0) as f64 / 1000.0;
 
             writeln!(
@@ -114,8 +124,11 @@ impl PrometheusFormatter {
 
         // Hop count percentiles
         {
-            let window = agg.lookup_hops.read().await;
-            let mut sorted: Vec<u8> = window.iter().copied().collect();
+            let hop_data: Vec<u8> = {
+                let window = agg.lookup_hops.read().await;
+                window.iter().copied().collect()
+            };
+            let mut sorted = hop_data;
             sorted.sort_unstable();
             let p50 = percentile_u8(&sorted, 50.0);
             let p95 = percentile_u8(&sorted, 95.0);
@@ -192,19 +205,24 @@ impl PrometheusFormatter {
     }
 
     async fn format_stream_metrics(out: &mut String, agg: &MetricsAggregator) -> std::fmt::Result {
-        // Bandwidth
+        // Bandwidth — collect data from guard, then drop guard before formatting
         {
-            let guard = agg.stream_bandwidth.read().await;
-            let map: &HashMap<StreamClass, VecDeque<u64>> = &guard;
-            if !map.is_empty() {
+            let bandwidth_data: Vec<(StreamClass, Vec<u64>)> = {
+                let guard = agg.stream_bandwidth.read().await;
+                guard
+                    .iter()
+                    .map(|(class, window)| (*class, window.iter().copied().collect()))
+                    .collect()
+            };
+            if !bandwidth_data.is_empty() {
                 writeln!(
                     out,
                     "# HELP p2p_stream_bandwidth_p50_bytes_per_sec Stream bandwidth p50"
                 )?;
                 writeln!(out, "# TYPE p2p_stream_bandwidth_p50_bytes_per_sec gauge")?;
-                for (class, window) in map {
-                    let label = stream_class_label(class);
-                    let mut sorted: Vec<u64> = window.iter().copied().collect();
+                for (class, window) in &bandwidth_data {
+                    let label = stream_class_label(*class);
+                    let mut sorted = window.clone();
                     sorted.sort_unstable();
                     let p50 = percentile_u64(&sorted, 50.0);
                     writeln!(
@@ -217,9 +235,9 @@ impl PrometheusFormatter {
                     "# HELP p2p_stream_bandwidth_p95_bytes_per_sec Stream bandwidth p95"
                 )?;
                 writeln!(out, "# TYPE p2p_stream_bandwidth_p95_bytes_per_sec gauge")?;
-                for (class, window) in map {
-                    let label = stream_class_label(class);
-                    let mut sorted: Vec<u64> = window.iter().copied().collect();
+                for (class, window) in &bandwidth_data {
+                    let label = stream_class_label(*class);
+                    let mut sorted = window.clone();
                     sorted.sort_unstable();
                     let p95 = percentile_u64(&sorted, 95.0);
                     writeln!(
@@ -230,20 +248,26 @@ impl PrometheusFormatter {
             }
         }
 
-        // RTT
+        // RTT — collect data from guard, then drop guard before formatting
         {
-            let guard = agg.stream_rtt.read().await;
-            let map: &HashMap<StreamClass, VecDeque<u64>> = &guard;
-            if !map.is_empty() {
+            let rtt_data: Vec<(StreamClass, Vec<u64>)> = {
+                let guard = agg.stream_rtt.read().await;
+                guard
+                    .iter()
+                    .map(|(class, window)| (*class, window.iter().copied().collect()))
+                    .collect()
+            };
+            if !rtt_data.is_empty() {
                 writeln!(
                     out,
                     "# HELP p2p_stream_rtt_p50_ms Stream RTT p50 in milliseconds"
                 )?;
                 writeln!(out, "# TYPE p2p_stream_rtt_p50_ms gauge")?;
-                for (class, window) in map {
-                    let label = stream_class_label(class);
-                    let mut sorted: Vec<u64> = window.iter().copied().collect();
+                for (class, window) in &rtt_data {
+                    let label = stream_class_label(*class);
+                    let mut sorted = window.clone();
                     sorted.sort_unstable();
+                    #[expect(clippy::cast_precision_loss)]
                     let p50 = percentile_u64(&sorted, 50.0) as f64 / 1000.0;
                     writeln!(out, "p2p_stream_rtt_p50_ms{{class=\"{label}\"}} {p50:.3}")?;
                 }
@@ -252,10 +276,11 @@ impl PrometheusFormatter {
                     "# HELP p2p_stream_rtt_p95_ms Stream RTT p95 in milliseconds"
                 )?;
                 writeln!(out, "# TYPE p2p_stream_rtt_p95_ms gauge")?;
-                for (class, window) in map {
-                    let label = stream_class_label(class);
-                    let mut sorted: Vec<u64> = window.iter().copied().collect();
+                for (class, window) in &rtt_data {
+                    let label = stream_class_label(*class);
+                    let mut sorted = window.clone();
                     sorted.sort_unstable();
+                    #[expect(clippy::cast_precision_loss)]
                     let p95 = percentile_u64(&sorted, 95.0) as f64 / 1000.0;
                     writeln!(out, "p2p_stream_rtt_p95_ms{{class=\"{label}\"}} {p95:.3}")?;
                 }
@@ -288,8 +313,11 @@ impl PrometheusFormatter {
             writeln!(out, "# TYPE p2p_storage_{op}_errors_total counter")?;
             writeln!(out, "p2p_storage_{op}_errors_total {errors}")?;
 
-            let window = counter.durations.read().await;
-            if window.is_empty() {
+            let durations: Vec<u64> = {
+                let window = counter.durations.read().await;
+                window.iter().copied().collect()
+            };
+            if durations.is_empty() {
                 writeln!(
                     out,
                     "# HELP p2p_storage_{op}_avg_duration_ms Average {op} duration in ms"
@@ -309,10 +337,13 @@ impl PrometheusFormatter {
                 writeln!(out, "# TYPE p2p_storage_{op}_max_duration_ms gauge")?;
                 writeln!(out, "p2p_storage_{op}_max_duration_ms 0")?;
             } else {
-                let sum: u64 = window.iter().sum();
-                let avg_ms = (sum as f64 / window.len() as f64) / 1000.0;
-                let min_ms = window.iter().copied().min().unwrap_or(0) as f64 / 1000.0;
-                let max_ms = window.iter().copied().max().unwrap_or(0) as f64 / 1000.0;
+                let sum: u64 = durations.iter().sum();
+                #[expect(clippy::cast_precision_loss)]
+                let avg_ms = (sum as f64 / durations.len() as f64) / 1000.0;
+                #[expect(clippy::cast_precision_loss)]
+                let min_ms = durations.iter().copied().min().unwrap_or(0) as f64 / 1000.0;
+                #[expect(clippy::cast_precision_loss)]
+                let max_ms = durations.iter().copied().max().unwrap_or(0) as f64 / 1000.0;
 
                 writeln!(
                     out,
@@ -440,7 +471,7 @@ impl PrometheusFormatter {
         Ok(())
     }
 
-    fn format_security_metrics(out: &mut String, m: &SecurityMetrics) -> std::fmt::Result {
+    fn format_security_attack_metrics(out: &mut String, m: &SecurityMetrics) -> std::fmt::Result {
         writeln!(
             out,
             "# HELP p2p_security_eclipse_score Eclipse attack risk score"
@@ -501,6 +532,13 @@ impl PrometheusFormatter {
             m.collusion_groups_detected_total
         )?;
 
+        Ok(())
+    }
+
+    fn format_security_operational_metrics(
+        out: &mut String,
+        m: &SecurityMetrics,
+    ) -> std::fmt::Result {
         writeln!(
             out,
             "# HELP p2p_security_bft_mode_active BFT consensus mode active"
@@ -555,6 +593,15 @@ impl PrometheusFormatter {
             m.nodes_evicted_total
         )?;
 
+        Self::format_security_validation_metrics(out, m)?;
+
+        Ok(())
+    }
+
+    fn format_security_validation_metrics(
+        out: &mut String,
+        m: &SecurityMetrics,
+    ) -> std::fmt::Result {
         writeln!(
             out,
             "# HELP p2p_security_witness_validations_total Total witness validations"
@@ -616,11 +663,7 @@ impl PrometheusFormatter {
         Ok(())
     }
 
-    fn format_trust_metrics(
-        out: &mut String,
-        m: &TrustMetrics,
-        trust_scores: &Option<HashMap<PeerId, f64>>,
-    ) -> std::fmt::Result {
+    fn format_trust_metrics(out: &mut String, m: &TrustMetrics) -> std::fmt::Result {
         writeln!(
             out,
             "# HELP p2p_trust_eigentrust_avg Average EigenTrust score"
@@ -693,6 +736,12 @@ impl PrometheusFormatter {
             m.negative_interactions_total
         )?;
 
+        Self::format_trust_witness_metrics(out, m)?;
+
+        Ok(())
+    }
+
+    fn format_trust_witness_metrics(out: &mut String, m: &TrustMetrics) -> std::fmt::Result {
         writeln!(
             out,
             "# HELP p2p_trust_witness_receipts_issued_total Witness receipts issued"
@@ -735,12 +784,21 @@ impl PrometheusFormatter {
             m.witness_receipts_rejected_total
         )?;
 
+        Ok(())
+    }
+
+    fn format_trust_distribution(
+        out: &mut String,
+        m: &TrustMetrics,
+        trust_scores: Option<&HashMap<PeerId, f64>>,
+    ) -> std::fmt::Result {
         // Trust score distribution from cached global trust
         if let Some(scores) = trust_scores {
             if !scores.is_empty() {
                 let mut buckets = [0u64; 10];
                 for score in scores.values() {
-                    let idx = (score * 10.0).floor().min(9.0).max(0.0) as usize;
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let idx = (score * 10.0).floor().clamp(0.0, 9.0) as usize;
                     buckets[idx] += 1;
                 }
                 writeln!(
@@ -749,7 +807,9 @@ impl PrometheusFormatter {
                 )?;
                 writeln!(out, "# TYPE p2p_trust_score_distribution gauge")?;
                 for (i, count) in buckets.iter().enumerate() {
+                    #[expect(clippy::cast_precision_loss)]
                     let lo = i as f64 / 10.0;
+                    #[expect(clippy::cast_precision_loss)]
                     let hi = (i + 1) as f64 / 10.0;
                     writeln!(
                         out,
@@ -781,7 +841,10 @@ impl PrometheusFormatter {
         Ok(())
     }
 
-    fn format_placement_metrics(out: &mut String, m: &PlacementMetrics) -> std::fmt::Result {
+    fn format_placement_storage_metrics(
+        out: &mut String,
+        m: &PlacementMetrics,
+    ) -> std::fmt::Result {
         writeln!(
             out,
             "# HELP p2p_placement_total_stored_bytes Total bytes stored"
@@ -847,6 +910,13 @@ impl PrometheusFormatter {
             m.used_capacity_ratio
         )?;
 
+        Ok(())
+    }
+
+    fn format_placement_balance_metrics(
+        out: &mut String,
+        m: &PlacementMetrics,
+    ) -> std::fmt::Result {
         writeln!(
             out,
             "# HELP p2p_placement_load_balance_score Load balance score"
@@ -935,11 +1005,17 @@ impl PrometheusFormatter {
         out: &mut String,
         agg: &MetricsAggregator,
     ) -> std::fmt::Result {
-        let window = agg.handshake_latencies.read().await;
-        let mut sorted: Vec<u64> = window.iter().copied().collect();
+        let latency_data: Vec<u64> = {
+            let window = agg.handshake_latencies.read().await;
+            window.iter().copied().collect()
+        };
+        let mut sorted = latency_data;
         sorted.sort_unstable();
+        #[expect(clippy::cast_precision_loss)]
         let p50 = percentile_u64(&sorted, 50.0) as f64 / 1000.0;
+        #[expect(clippy::cast_precision_loss)]
         let p95 = percentile_u64(&sorted, 95.0) as f64 / 1000.0;
+        #[expect(clippy::cast_precision_loss)]
         let p99 = percentile_u64(&sorted, 99.0) as f64 / 1000.0;
 
         writeln!(
@@ -972,11 +1048,17 @@ impl PrometheusFormatter {
     ) -> std::fmt::Result {
         // DHT put latencies
         {
-            let window = agg.dht_put_latencies.read().await;
-            let mut sorted: Vec<u64> = window.iter().copied().collect();
+            let put_data: Vec<u64> = {
+                let window = agg.dht_put_latencies.read().await;
+                window.iter().copied().collect()
+            };
+            let mut sorted = put_data;
             sorted.sort_unstable();
+            #[expect(clippy::cast_precision_loss)]
             let p50 = percentile_u64(&sorted, 50.0) as f64 / 1000.0;
+            #[expect(clippy::cast_precision_loss)]
             let p95 = percentile_u64(&sorted, 95.0) as f64 / 1000.0;
+            #[expect(clippy::cast_precision_loss)]
             let p99 = percentile_u64(&sorted, 99.0) as f64 / 1000.0;
 
             writeln!(
@@ -1003,11 +1085,17 @@ impl PrometheusFormatter {
 
         // DHT get latencies
         {
-            let window = agg.dht_get_latencies.read().await;
-            let mut sorted: Vec<u64> = window.iter().copied().collect();
+            let get_data: Vec<u64> = {
+                let window = agg.dht_get_latencies.read().await;
+                window.iter().copied().collect()
+            };
+            let mut sorted = get_data;
             sorted.sort_unstable();
+            #[expect(clippy::cast_precision_loss)]
             let p50 = percentile_u64(&sorted, 50.0) as f64 / 1000.0;
+            #[expect(clippy::cast_precision_loss)]
             let p95 = percentile_u64(&sorted, 95.0) as f64 / 1000.0;
+            #[expect(clippy::cast_precision_loss)]
             let p99 = percentile_u64(&sorted, 99.0) as f64 / 1000.0;
 
             writeln!(
@@ -1046,7 +1134,10 @@ impl PrometheusFormatter {
         Ok(())
     }
 
-    fn format_extended_transport_metrics(out: &mut String, m: &TransportStats) -> std::fmt::Result {
+    fn format_transport_connection_metrics(
+        out: &mut String,
+        m: &TransportStats,
+    ) -> std::fmt::Result {
         writeln!(
             out,
             "# HELP p2p_transport_total_connections_established Total connections established"
@@ -1076,7 +1167,9 @@ impl PrometheusFormatter {
         let success_rate = if total_attempts == 0 {
             0.0
         } else {
-            m.total_connections_established as f64 / total_attempts as f64
+            #[expect(clippy::cast_precision_loss)]
+            let rate = m.total_connections_established as f64 / total_attempts as f64;
+            rate
         };
         writeln!(
             out,
@@ -1106,6 +1199,10 @@ impl PrometheusFormatter {
             m.bytes_received_total
         )?;
 
+        Ok(())
+    }
+
+    fn format_transport_nat_metrics(out: &mut String, m: &TransportStats) -> std::fmt::Result {
         writeln!(
             out,
             "# HELP p2p_transport_nat_traversal_attempts_total Total NAT traversal attempts"
@@ -1137,7 +1234,9 @@ impl PrometheusFormatter {
         let nat_rate = if m.nat_traversal_attempts == 0 {
             0.0
         } else {
-            m.nat_traversal_successes as f64 / m.nat_traversal_attempts as f64
+            #[expect(clippy::cast_precision_loss)]
+            let rate = m.nat_traversal_successes as f64 / m.nat_traversal_attempts as f64;
+            rate
         };
         writeln!(
             out,
@@ -1167,9 +1266,11 @@ impl PrometheusFormatter {
         out: &mut String,
         agg: &MetricsAggregator,
     ) -> std::fmt::Result {
-        let guard = agg.connection_failures_by_reason.read().await;
-        let map: &HashMap<String, u64> = &guard;
-        if !map.is_empty() {
+        let failure_data: Vec<(String, u64)> = {
+            let guard = agg.connection_failures_by_reason.read().await;
+            guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
+        if !failure_data.is_empty() {
             writeln!(
                 out,
                 "# HELP p2p_transport_connection_failures_by_reason Connection failures by reason"
@@ -1178,7 +1279,7 @@ impl PrometheusFormatter {
                 out,
                 "# TYPE p2p_transport_connection_failures_by_reason counter"
             )?;
-            for (reason, count) in map {
+            for (reason, count) in &failure_data {
                 writeln!(
                     out,
                     "p2p_transport_connection_failures_by_reason{{reason=\"{reason}\"}} {count}"
@@ -1201,10 +1302,15 @@ impl PrometheusFormatter {
         writeln!(out, "p2p_replication_cycles_total {cycles}")?;
 
         {
-            let window = agg.replication_durations.read().await;
-            let mut sorted: Vec<u64> = window.iter().copied().collect();
+            let duration_data: Vec<u64> = {
+                let window = agg.replication_durations.read().await;
+                window.iter().copied().collect()
+            };
+            let mut sorted = duration_data;
             sorted.sort_unstable();
+            #[expect(clippy::cast_precision_loss)]
             let p50 = percentile_u64(&sorted, 50.0) as f64 / 1000.0;
+            #[expect(clippy::cast_precision_loss)]
             let p95 = percentile_u64(&sorted, 95.0) as f64 / 1000.0;
 
             writeln!(
@@ -1286,7 +1392,8 @@ impl PrometheusFormatter {
             writeln!(
                 out,
                 "p2p_strategy_selections_total{{strategy=\"{}\"}} {}",
-                format!("{:?}", s.strategy), s.selections
+                format_args!("{:?}", s.strategy),
+                s.selections
             )?;
         }
 
@@ -1299,7 +1406,8 @@ impl PrometheusFormatter {
             writeln!(
                 out,
                 "p2p_strategy_successes_total{{strategy=\"{}\"}} {}",
-                format!("{:?}", s.strategy), s.successes
+                format_args!("{:?}", s.strategy),
+                s.successes
             )?;
         }
 
@@ -1312,7 +1420,8 @@ impl PrometheusFormatter {
             writeln!(
                 out,
                 "p2p_strategy_estimated_success_rate{{strategy=\"{}\"}} {:.6}",
-                format!("{:?}", s.strategy), s.estimated_success_rate
+                format_args!("{:?}", s.strategy),
+                s.estimated_success_rate
             )?;
         }
 
@@ -1325,7 +1434,8 @@ impl PrometheusFormatter {
             writeln!(
                 out,
                 "p2p_strategy_alpha{{strategy=\"{}\"}} {:.6}",
-                format!("{:?}", s.strategy), s.alpha
+                format_args!("{:?}", s.strategy),
+                s.alpha
             )?;
         }
 
@@ -1338,7 +1448,8 @@ impl PrometheusFormatter {
             writeln!(
                 out,
                 "p2p_strategy_beta{{strategy=\"{}\"}} {:.6}",
-                format!("{:?}", s.strategy), s.beta
+                format_args!("{:?}", s.strategy),
+                s.beta
             )?;
         }
 
@@ -1347,7 +1458,7 @@ impl PrometheusFormatter {
 }
 
 /// Map [`StreamClass`] to a Prometheus label value.
-fn stream_class_label(class: &StreamClass) -> &'static str {
+fn stream_class_label(class: StreamClass) -> &'static str {
     match class {
         StreamClass::Control => "control",
         StreamClass::Mls => "mls",
