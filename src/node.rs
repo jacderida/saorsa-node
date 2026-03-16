@@ -605,6 +605,10 @@ impl RunningNode {
     pub async fn run(&mut self) -> Result<()> {
         info!("Node runtime loop starting");
 
+        // Subscribe to metric events before starting the P2P node so we
+        // don't miss connection/handshake events emitted during startup.
+        self.start_metric_event_loop();
+
         // Start the P2P node
         self.p2p_node
             .start()
@@ -621,9 +625,6 @@ impl RunningNode {
 
         // Start protocol message routing (P2P → AntProtocol → P2P response)
         self.start_protocol_routing();
-
-        // Start metric event subscription loop
-        self.start_metric_event_loop();
 
         // Start health/metrics HTTP server if metrics_port != 0
         self.start_health_server();
