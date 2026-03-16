@@ -1276,6 +1276,7 @@ impl TestNetwork {
         core_config.listen_addr = node.address;
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false; // Disable IPv6 for local testing to avoid dual-stack binding issues
+        core_config.allow_loopback = true; // All test nodes run on 127.0.0.1
         core_config.connection_timeout = Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS);
         core_config.bootstrap_peers = node
             .bootstrap_addrs
