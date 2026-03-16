@@ -551,8 +551,9 @@ async fn test_payment_with_node_failures() -> Result<(), Box<dyn std::error::Err
     info!("Simulating node failures: shutting down nodes 5, 6, 7");
     env.harness.shutdown_nodes(&[5, 6, 7]).await?;
 
-    // Wait for network to adapt to failures
-    sleep(Duration::from_secs(15)).await;
+    // Wait for network to adapt to failures — Windows needs longer due to
+    // slower connection teardown and DHT routing table convergence.
+    sleep(Duration::from_secs(30)).await;
 
     // Verify nodes are shut down
     let remaining_count = env.harness.running_node_count().await;
@@ -564,7 +565,7 @@ async fn test_payment_with_node_failures() -> Result<(), Box<dyn std::error::Err
 
     // Re-warm DHT after node failures so routing tables adapt
     env.harness.warmup_dht().await?;
-    sleep(Duration::from_secs(15)).await;
+    sleep(Duration::from_secs(30)).await;
 
     // Store a chunk with the remaining nodes (7 nodes still > 5 needed for quotes)
     let test_data = b"Resilience test data";
