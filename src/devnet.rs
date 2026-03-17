@@ -14,9 +14,11 @@ use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
-use saorsa_core::{IPDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId};
+use saorsa_core::{
+    IPDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId,
+};
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -228,7 +230,7 @@ pub struct DevnetManifest {
     /// Node count.
     pub node_count: usize,
     /// Bootstrap addresses.
-    pub bootstrap: Vec<SocketAddr>,
+    pub bootstrap: Vec<MultiAddr>,
     /// Data directory.
     pub data_dir: PathBuf,
     /// Creation time in RFC3339.
@@ -294,13 +296,12 @@ pub struct DevnetNode {
     label: String,
     peer_id: PeerId,
     port: u16,
-    address: SocketAddr,
     data_dir: PathBuf,
     p2p_node: Option<Arc<P2PNode>>,
     ant_protocol: Option<Arc<AntProtocol>>,
     is_bootstrap: bool,
     state: Arc<RwLock<NodeState>>,
-    bootstrap_addrs: Vec<SocketAddr>,
+    bootstrap_addrs: Vec<MultiAddr>,
     protocol_task: Option<JoinHandle<()>>,
 }
 
@@ -465,11 +466,11 @@ impl Devnet {
 
     /// Get bootstrap addresses.
     #[must_use]
-    pub fn bootstrap_addrs(&self) -> Vec<SocketAddr> {
+    pub fn bootstrap_addrs(&self) -> Vec<MultiAddr> {
         self.nodes
             .iter()
             .take(self.config.bootstrap_count)
-            .map(|n| n.address)
+            .map(|n| MultiAddr::quic(SocketAddr::from((Ipv4Addr::LOCALHOST, n.port))))
             .collect()
     }
 
@@ -493,7 +494,7 @@ impl Devnet {
         let regular_count = self.config.node_count - self.config.bootstrap_count;
         info!("Starting {} regular nodes", regular_count);
 
-        let bootstrap_addrs: Vec<SocketAddr> = self
+        let bootstrap_addrs: Vec<MultiAddr> = self
             .nodes
             .get(0..self.config.bootstrap_count)
             .ok_or_else(|| {
@@ -504,7 +505,7 @@ impl Devnet {
                 ))
             })?
             .iter()
-            .map(|n| n.address)
+            .map(|n| MultiAddr::quic(SocketAddr::from((Ipv4Addr::LOCALHOST, n.port))))
             .collect();
 
         for i in self.config.bootstrap_count..self.config.node_count {
@@ -521,12 +522,11 @@ impl Devnet {
         &self,
         index: usize,
         is_bootstrap: bool,
-        bootstrap_addrs: Vec<SocketAddr>,
+        bootstrap_addrs: Vec<MultiAddr>,
     ) -> Result<DevnetNode> {
         let index_u16 = u16::try_from(index)
             .map_err(|_| DevnetError::Config(format!("Node index {index} exceeds u16::MAX")))?;
         let port = self.config.base_port + index_u16;
-        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
         // Generate identity first so we can use peer_id as the directory name
         let identity = NodeIdentity::generate()
@@ -553,7 +553,6 @@ impl Devnet {
             label,
             peer_id,
             port,
-            address,
             data_dir,
             p2p_node: None,
             ant_protocol: Some(Arc::new(ant_protocol)),
@@ -621,10 +620,14 @@ impl Devnet {
         debug!("Starting node {} on port {}", node.index, node.port);
         *node.state.write().await = NodeState::Starting;
 
-        let mut core_config = CoreNodeConfig::new()
+        let mut core_config = CoreNodeConfig::builder()
+            .port(node.port)
+            .local(true)
+            .max_message_size(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE)
+            .build()
             .map_err(|e| DevnetError::Core(format!("Failed to create core config: {e}")))?;
 
-        // Load the node identity for app-level message signing
+        // Load the node identity for app-level message signing.
         let identity = NodeIdentity::load_from_file(
             &node.data_dir.join(crate::config::NODE_IDENTITY_FILENAME),
         )
@@ -632,13 +635,7 @@ impl Devnet {
         .map_err(|e| DevnetError::Core(format!("Failed to load node identity: {e}")))?;
 
         core_config.node_identity = Some(Arc::new(identity));
-        core_config.listen_addr = node.address;
-        core_config.listen_addrs = vec![node.address];
-        core_config.enable_ipv6 = false;
-        core_config
-            .bootstrap_peers
-            .clone_from(&node.bootstrap_addrs);
-        core_config.max_message_size = Some(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
+        core_config.bootstrap_peers = node.bootstrap_addrs.clone();
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
         let index = node.index;

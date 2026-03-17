@@ -120,13 +120,13 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         .as_ref()
         .ok_or("Client not configured")?;
 
-    let mut quotes_with_prices = None;
+    let mut quote_result = None;
     for attempt in 1..=10 {
         info!("Quote collection attempt {attempt}/10...");
         match client.get_quotes_from_dht(test_data).await {
-            Ok(quotes) => {
+            Ok((target_peer, quotes)) => {
                 info!("Got {} quotes on attempt {attempt}", quotes.len());
-                quotes_with_prices = Some(quotes);
+                quote_result = Some((target_peer, quotes));
                 break;
             }
             Err(e) => {
@@ -139,7 +139,8 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         }
     }
 
-    let quotes_with_prices = quotes_with_prices.ok_or("Failed to get quotes after 10 attempts")?;
+    let (target_peer, quotes_with_prices) =
+        quote_result.ok_or("Failed to get quotes after 10 attempts")?;
 
     assert_eq!(
         quotes_with_prices.len(),
@@ -200,7 +201,11 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
     let mut stored_address = None;
     for attempt in 1..=10 {
         match client
-            .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes.clone())
+            .put_chunk_with_proof(
+                Bytes::from(test_data.to_vec()),
+                proof_bytes.clone(),
+                &target_peer,
+            )
             .await
         {
             Ok(addr) => {
@@ -384,11 +389,11 @@ async fn test_forged_signature_rejection() -> Result<(), Box<dyn std::error::Err
     let test_data = b"Forged signature test data";
 
     // Get quotes from DHT
-    let mut quotes_with_prices = None;
+    let mut quote_result = None;
     for attempt in 1..=5 {
         match client.get_quotes_from_dht(test_data).await {
-            Ok(quotes) => {
-                quotes_with_prices = Some(quotes);
+            Ok((target_peer, quotes)) => {
+                quote_result = Some((target_peer, quotes));
                 break;
             }
             Err(e) => {
@@ -400,7 +405,8 @@ async fn test_forged_signature_rejection() -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    let quotes_with_prices = quotes_with_prices.ok_or("Failed to get quotes after 5 attempts")?;
+    let (target_peer, quotes_with_prices) =
+        quote_result.ok_or("Failed to get quotes after 5 attempts")?;
 
     // Build peer_quotes and payment
     let mut peer_quotes: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
@@ -442,7 +448,11 @@ async fn test_forged_signature_rejection() -> Result<(), Box<dyn std::error::Err
 
     // Try to store with forged proof — MUST be rejected
     let result = client
-        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), forged_proof_bytes)
+        .put_chunk_with_proof(
+            Bytes::from(test_data.to_vec()),
+            forged_proof_bytes,
+            &target_peer,
+        )
         .await;
 
     assert!(result.is_err(), "Storage MUST fail with forged signature");
@@ -505,7 +515,7 @@ async fn test_payment_flow_with_failures() -> Result<(), Box<dyn std::error::Err
     for attempt in 1..=10 {
         info!("Storage attempt {attempt}/10 after node failures...");
         match client.get_quotes_from_dht(test_data).await {
-            Ok(quotes) => {
+            Ok((_target_peer, quotes)) => {
                 info!("Collected {} quotes despite failures", quotes.len());
                 match client.put_chunk(Bytes::from(test_data.to_vec())).await {
                     Ok(_address) => {

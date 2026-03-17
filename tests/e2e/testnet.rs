@@ -21,8 +21,8 @@ use futures::future::join_all;
 use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::{
-    identity::NodeIdentity, IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig,
-    P2PEvent, P2PNode,
+    identity::NodeIdentity, IPDiversityConfig as CoreDiversityConfig, MultiAddr,
+    NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
 };
 use saorsa_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
@@ -34,7 +34,7 @@ use saorsa_node::payment::{
     QuotingMetricsTracker,
 };
 use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -359,9 +359,6 @@ pub struct TestNode {
     /// Port this node listens on.
     pub port: u16,
 
-    /// Socket address for this node.
-    pub address: SocketAddr,
-
     /// Root directory for this node's data.
     pub data_dir: PathBuf,
 
@@ -384,7 +381,7 @@ pub struct TestNode {
     pub state: Arc<RwLock<NodeState>>,
 
     /// Bootstrap addresses this node connects to.
-    pub bootstrap_addrs: Vec<SocketAddr>,
+    pub bootstrap_addrs: Vec<MultiAddr>,
 
     /// ML-DSA-65 identity used for quote signing.
     ///
@@ -481,8 +478,10 @@ impl TestNode {
         // Compute the chunk address
         let address = Self::compute_chunk_address(data);
 
-        // Get quotes from the network (includes peer IDs for proof of payment)
-        let quotes_with_peers = client
+        // Get quotes from the network (includes peer IDs for proof of payment).
+        // The target_peer is the closest peer pinned during quoting — we store to
+        // this peer to guarantee the storage target was paid.
+        let (target_peer, quotes_with_peers) = client
             .get_quotes_from_dht(data)
             .await
             .map_err(|e| TestnetError::Storage(format!("Failed to get quotes: {e}")))?;
@@ -526,7 +525,7 @@ impl TestNode {
         // Use put_chunk_with_proof to send the pre-built proof, avoiding a
         // redundant quote+pay cycle that put_chunk_with_payment would perform.
         client
-            .put_chunk_with_proof(Bytes::from(data.to_vec()), proof_bytes)
+            .put_chunk_with_proof(Bytes::from(data.to_vec()), proof_bytes, &target_peer)
             .await
             .map_err(|e| TestnetError::Storage(format!("Client PUT error: {e}")))
     }
@@ -1109,12 +1108,12 @@ impl TestNetwork {
         let regular_count = self.config.node_count - self.config.bootstrap_count;
         info!("Starting {} regular nodes", regular_count);
 
-        let bootstrap_addrs: Vec<SocketAddr> = self
+        let bootstrap_addrs: Vec<MultiAddr> = self
             .nodes
             .get(0..self.config.bootstrap_count)
             .unwrap_or_default()
             .iter()
-            .map(|n| n.address)
+            .map(|n| MultiAddr::quic(SocketAddr::from((Ipv4Addr::LOCALHOST, n.port))))
             .collect();
 
         for i in self.config.bootstrap_count..self.config.node_count {
@@ -1139,13 +1138,12 @@ impl TestNetwork {
         &self,
         index: usize,
         is_bootstrap: bool,
-        bootstrap_addrs: Vec<SocketAddr>,
+        bootstrap_addrs: Vec<MultiAddr>,
     ) -> Result<TestNode> {
         // Safe: node_count is validated in TestNetwork::new() to fit in u16
         let index_u16 = u16::try_from(index)
             .map_err(|_| TestnetError::Config(format!("Node index {index} exceeds u16::MAX")))?;
         let port = self.config.base_port + index_u16;
-        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let node_id = format!("test_node_{index}");
         let data_dir = self.config.test_data_dir.join(&node_id);
 
@@ -1170,7 +1168,6 @@ impl TestNetwork {
             index,
             node_id,
             port,
-            address,
             data_dir,
             p2p_node: None,
             ant_protocol: Some(Arc::new(ant_protocol)),
@@ -1269,31 +1266,17 @@ impl TestNetwork {
         debug!("Starting node {} on port {}", node.index, node.port);
         *node.state.write().await = NodeState::Starting;
 
-        // Build configuration for saorsa-core P2PNode
-        let mut core_config = CoreNodeConfig::new()
+        // Build configuration for saorsa-core P2PNode.
+        // .local(true) auto-enables allow_loopback for test nodes on 127.0.0.1.
+        let mut core_config = CoreNodeConfig::builder()
+            .port(node.port)
+            .local(true)
+            .connection_timeout(Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS))
+            .max_message_size(saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE)
+            .build()
             .map_err(|e| TestnetError::Core(format!("Failed to create core config: {e}")))?;
 
-        core_config.listen_addr = node.address;
-        core_config.listen_addrs = vec![node.address];
-        core_config.enable_ipv6 = false; // Disable IPv6 for local testing to avoid dual-stack binding issues
-        core_config.connection_timeout = Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS);
-        core_config
-            .bootstrap_peers
-            .clone_from(&node.bootstrap_addrs);
-        // Override the transport-layer message size to accommodate max-size
-        // chunks (4 MiB payload + serialization overhead = 5 MiB wire).
-        core_config.max_message_size = Some(saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
-        // Generate a node identity so auto identity announce works on connect.
-        let identity = NodeIdentity::generate().map_err(|e| {
-            TestnetError::Core(format!(
-                "Failed to generate identity for node {}: {e}",
-                node.index
-            ))
-        })?;
-        core_config.node_identity = Some(Arc::new(identity));
-
-        // Allow localhost peers in DHT routing for test environments
-        // This prevents diversity filters from excluding peers on 127.0.0.1
+        core_config.bootstrap_peers = node.bootstrap_addrs.clone();
         core_config.diversity_config = Some(CoreDiversityConfig::permissive());
 
         // Inject the ML-DSA identity so the P2PNode's transport peer ID

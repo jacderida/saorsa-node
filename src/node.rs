@@ -17,10 +17,9 @@ use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
-    IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
-    ProductionConfig as CoreProductionConfig,
+    IPDiversityConfig as CoreDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent,
+    P2PNode,
 };
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -172,44 +171,35 @@ impl NodeBuilder {
 
     /// Build the saorsa-core `NodeConfig` from our config.
     fn build_core_config(config: &NodeConfig) -> Result<CoreNodeConfig> {
-        // Determine listen address based on port and IP version
-        let port = config.port;
-        let listen_addr: SocketAddr = match config.ip_version {
-            IpVersion::Ipv4 | IpVersion::Dual => format!("0.0.0.0:{port}")
-                .parse()
-                .map_err(|e| Error::Config(format!("Invalid listen address: {e}")))?,
-            IpVersion::Ipv6 => format!("[::]:{port}")
-                .parse()
-                .map_err(|e| Error::Config(format!("Invalid listen address: {e}")))?,
-        };
+        let ipv6 = matches!(config.ip_version, IpVersion::Ipv6 | IpVersion::Dual);
+        let local = matches!(config.network_mode, NetworkMode::Development);
 
-        let mut core_config = CoreNodeConfig::new()
+        let mut core_config = CoreNodeConfig::builder()
+            .port(config.port)
+            .ipv6(ipv6)
+            .local(local)
+            .max_message_size(config.max_message_size)
+            .build()
             .map_err(|e| Error::Config(format!("Failed to create core config: {e}")))?;
 
-        // Set listen address
-        core_config.listen_addr = listen_addr;
-        core_config.listen_addrs = vec![listen_addr];
-
-        // Enable IPv6 if configured
-        core_config.enable_ipv6 = matches!(config.ip_version, IpVersion::Ipv6 | IpVersion::Dual);
-
         // Add bootstrap peers.
-        core_config.bootstrap_peers.clone_from(&config.bootstrap);
-
-        // Forward max_message_size to the transport layer.
-        core_config.max_message_size = Some(config.max_message_size);
+        core_config.bootstrap_peers = config
+            .bootstrap
+            .iter()
+            .map(|addr| MultiAddr::quic(*addr))
+            .collect();
 
         // Propagate network-mode tuning into saorsa-core where supported.
         match config.network_mode {
             NetworkMode::Production => {
-                core_config.production_config = Some(CoreProductionConfig::default());
                 core_config.diversity_config = Some(CoreDiversityConfig::default());
             }
             NetworkMode::Testnet => {
-                core_config.production_config = Some(CoreProductionConfig::default());
+                // Testnet allows loopback so nodes can be co-located on one machine.
+                core_config.allow_loopback = true;
                 let mut diversity = CoreDiversityConfig::testnet();
                 diversity.max_nodes_per_asn = config.testnet.max_nodes_per_asn;
-                diversity.max_nodes_per_64 = config.testnet.max_nodes_per_64;
+                diversity.max_nodes_per_ipv6_64 = config.testnet.max_nodes_per_64;
                 diversity.enable_geolocation_check = config.testnet.enable_geo_checks;
                 diversity.min_geographic_diversity = if config.testnet.enable_geo_checks {
                     3
@@ -226,7 +216,6 @@ impl NodeBuilder {
                 }
             }
             NetworkMode::Development => {
-                core_config.production_config = None;
                 core_config.diversity_config = Some(CoreDiversityConfig::permissive());
             }
         }
@@ -565,17 +554,11 @@ impl RunningNode {
 
         // Log bootstrap cache stats before shutdown
         if let Some(ref manager) = self.bootstrap_manager {
-            match manager.get_stats().await {
-                Ok(stats) => {
-                    info!(
-                        "Bootstrap cache shutdown: {} contacts, avg quality {:.2}",
-                        stats.total_contacts, stats.average_quality_score
-                    );
-                }
-                Err(e) => {
-                    debug!("Failed to get bootstrap cache stats: {e}");
-                }
-            }
+            let stats = manager.stats().await;
+            info!(
+                "Bootstrap cache shutdown: {} peers, avg quality {:.2}",
+                stats.total_peers, stats.average_quality
+            );
         }
 
         // Stop protocol routing task
@@ -748,7 +731,6 @@ mod tests {
             ..Default::default()
         };
         let core = NodeBuilder::build_core_config(&config).expect("core config");
-        assert!(core.production_config.is_some());
         assert!(core.diversity_config.is_some());
     }
 
@@ -759,7 +741,6 @@ mod tests {
             ..Default::default()
         };
         let core = NodeBuilder::build_core_config(&config).expect("core config");
-        assert!(core.production_config.is_none());
         let diversity = core.diversity_config.expect("diversity");
         assert!(diversity.is_relaxed());
     }

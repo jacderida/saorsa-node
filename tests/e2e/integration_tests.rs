@@ -312,8 +312,10 @@ async fn test_quantum_client_chunk_round_trip() {
     // client-side early-rejection fix).
     let content = Bytes::from("quantum client e2e test payload");
     let dummy_proof = vec![0u8; 64];
+    let peers = node.connected_peers().await;
+    let target_peer = peers.first().expect("Node should have connected peers");
     let address = client
-        .put_chunk_with_proof(content.clone(), dummy_proof)
+        .put_chunk_with_proof(content.clone(), dummy_proof, target_peer)
         .await
         .expect("QuantumClient::put_chunk_with_proof should succeed");
 

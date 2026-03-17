@@ -32,7 +32,7 @@ use evmlib::wallet::Wallet;
 use futures::stream::{FuturesUnordered, StreamExt};
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +46,40 @@ const CLOSE_GROUP_SIZE: usize = 8;
 
 /// Default number of replicas for data redundancy.
 const DEFAULT_REPLICA_COUNT: u8 = 4;
+
+/// A chunk that has been quoted but not yet paid or stored.
+///
+/// Produced by [`QuantumClient::prepare_chunk_payment`] and consumed by
+/// [`QuantumClient::batch_pay`] or [`QuantumClient::batch_pay_and_store`].
+pub struct PreparedChunk {
+    /// The raw chunk content.
+    pub content: Bytes,
+    /// Content-address (BLAKE3 hash).
+    pub address: XorName,
+    /// Peer ID + quote pairs for building `ProofOfPayment`.
+    pub peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>,
+    /// The payment structure (sorted quotes, median selected).
+    pub payment: SingleNodePayment,
+    /// The closest peer to the chunk address, pinned during quote collection
+    /// so that the storage target is always one of the paid peers.
+    pub target_peer: PeerId,
+}
+
+/// A chunk that has been paid on-chain but not yet stored on the network.
+///
+/// Produced by [`QuantumClient::batch_pay`]. Store via
+/// [`QuantumClient::put_chunk_with_proof`].
+pub struct PaidChunk {
+    /// The raw chunk content.
+    pub content: Bytes,
+    /// Serialized payment proof (msgpack bytes).
+    pub proof_bytes: Vec<u8>,
+    /// Transaction hashes from this chunk's on-chain payment.
+    pub tx_hashes: Vec<evmlib::common::TxHash>,
+    /// The closest peer to the chunk address, pinned during quote collection
+    /// so that the storage target is always one of the paid peers.
+    pub target_peer: PeerId,
+}
 
 /// Configuration for the quantum-resistant client.
 #[derive(Debug, Clone)]
@@ -279,8 +313,9 @@ impl QuantumClient {
         let data_size = u64::try_from(content_size)
             .map_err(|e| Error::Network(format!("Content size too large: {e}")))?;
 
-        // Step 1: Request quotes from network nodes via DHT
-        let quotes_with_peers = self
+        // Step 1: Request quotes from network nodes via DHT.
+        // The closest peer is pinned here so we store to a peer that was paid.
+        let (target_peer, quotes_with_peers) = self
             .get_quotes_from_dht_for_address(&address, data_size)
             .await?;
 
@@ -327,9 +362,7 @@ impl QuantumClient {
         let payment_proof = rmp_serde::to_vec(&proof)
             .map_err(|e| Error::Network(format!("Failed to serialize payment proof: {e}")))?;
 
-        // Step 6: Send chunk with payment proof to storage node
-        let target_peer = Self::pick_target_peer(node, &address).await?;
-
+        // Step 6: Send chunk with payment proof to the peer pinned during quoting
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = ChunkPutRequest::with_payment(address, content.to_vec(), payment_proof);
         let message = ChunkMessage {
@@ -356,13 +389,16 @@ impl QuantumClient {
 
     /// Store a chunk with a pre-built payment proof, skipping the internal payment flow.
     ///
-    /// Use this when you have already obtained quotes and paid on-chain externally
-    /// (e.g. via [`SingleNodePayment::pay`]) and want to avoid a redundant payment cycle.
+    /// The `target_peer` should be the peer pinned during quote collection so that
+    /// the storage target is guaranteed to be one of the paid peers. Use the
+    /// `target_peer` field from [`PaidChunk`] or the first element returned by
+    /// [`get_quotes_from_dht`](Self::get_quotes_from_dht).
     ///
     /// # Arguments
     ///
     /// * `content` - The data to store
     /// * `proof` - A serialised [`ProofOfPayment`] (msgpack bytes)
+    /// * `target_peer` - The peer to send the chunk to (pinned during quoting)
     ///
     /// # Returns
     ///
@@ -372,17 +408,19 @@ impl QuantumClient {
     ///
     /// Returns an error if:
     /// - P2P node is not configured
-    /// - No remote peers found near the target address
     /// - Storage operation fails
-    pub async fn put_chunk_with_proof(&self, content: Bytes, proof: Vec<u8>) -> Result<XorName> {
+    pub async fn put_chunk_with_proof(
+        &self,
+        content: Bytes,
+        proof: Vec<u8>,
+        target_peer: &PeerId,
+    ) -> Result<XorName> {
         let Some(ref node) = self.p2p_node else {
             return Err(Error::Network("P2P node not configured".into()));
         };
 
         let address = compute_address(&content);
         let content_size = content.len();
-
-        let target_peer = Self::pick_target_peer(node, &address).await?;
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = ChunkPutRequest::with_payment(address, content.to_vec(), proof);
@@ -396,7 +434,7 @@ impl QuantumClient {
 
         Self::send_put_and_await(
             node,
-            &target_peer,
+            target_peer,
             message_bytes,
             request_id,
             self.config.timeout_secs,
@@ -404,6 +442,193 @@ impl QuantumClient {
             content_size,
         )
         .await
+    }
+
+    /// Collect quotes for a chunk without paying.
+    ///
+    /// Returns a [`PreparedChunk`] containing all the information needed to
+    /// pay and store the chunk later. Use with [`batch_pay_and_store`](Self::batch_pay_and_store)
+    /// to pay for multiple chunks in a single EVM transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if DHT lookup or quote collection fails.
+    pub async fn prepare_chunk_payment(&self, content: Bytes) -> Result<PreparedChunk> {
+        let content_len = content.len();
+        debug!("Preparing payment for chunk ({content_len} bytes)");
+
+        self.p2p_node
+            .as_ref()
+            .ok_or_else(|| Error::Network("P2P node not configured".into()))?;
+
+        self.wallet.as_ref().ok_or_else(|| {
+            Error::Payment(
+                "Wallet not configured - use with_wallet() to enable payments".to_string(),
+            )
+        })?;
+
+        let address = compute_address(&content);
+        let data_size = u64::try_from(content.len())
+            .map_err(|e| Error::Network(format!("Content size too large: {e}")))?;
+
+        let (target_peer, quotes_with_peers) = self
+            .get_quotes_from_dht_for_address(&address, data_size)
+            .await?;
+
+        if quotes_with_peers.len() != REQUIRED_QUOTES {
+            return Err(Error::Payment(format!(
+                "Expected {REQUIRED_QUOTES} quotes but received {}",
+                quotes_with_peers.len()
+            )));
+        }
+
+        let mut peer_quotes: Vec<(EncodedPeerId, PaymentQuote)> =
+            Vec::with_capacity(quotes_with_peers.len());
+        let mut quotes_with_prices: Vec<(PaymentQuote, Amount)> =
+            Vec::with_capacity(quotes_with_peers.len());
+
+        for (peer_id, quote, price) in quotes_with_peers {
+            let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id.to_hex())?;
+            peer_quotes.push((encoded_peer_id, quote.clone()));
+            quotes_with_prices.push((quote, price));
+        }
+
+        let payment = SingleNodePayment::from_quotes(quotes_with_prices)?;
+
+        Ok(PreparedChunk {
+            content,
+            address,
+            peer_quotes,
+            payment,
+            target_peer,
+        })
+    }
+
+    /// Pay for multiple prepared chunks in a single EVM transaction.
+    ///
+    /// Returns [`PaidChunk`]s ready for storage via [`put_chunk_with_proof`](Self::put_chunk_with_proof).
+    /// Use this for pipelined uploads where stores from wave N overlap with
+    /// quotes for wave N+1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the EVM payment fails.
+    pub async fn batch_pay(&self, prepared: Vec<PreparedChunk>) -> Result<Vec<PaidChunk>> {
+        let Some(ref wallet) = self.wallet else {
+            return Err(Error::Payment(
+                "Wallet not configured - use with_wallet() to enable payments".to_string(),
+            ));
+        };
+
+        if prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let total_amount: Amount = prepared.iter().map(|p| p.payment.total_amount()).sum();
+        let chunk_count = prepared.len();
+        info!("Batch payment for {chunk_count} chunks: {total_amount} atto total");
+
+        let all_quote_payments: Vec<(ant_evm::QuoteHash, ant_evm::RewardsAddress, Amount)> =
+            prepared
+                .iter()
+                .flat_map(|p| &p.payment.quotes)
+                .map(|q| (q.quote_hash, q.rewards_address, q.amount))
+                .collect();
+
+        let (tx_hash_map, _gas_info) = wallet.pay_for_quotes(all_quote_payments).await.map_err(
+            |evmlib::wallet::PayForQuotesError(err, _)| {
+                Error::Payment(format!("Batch payment failed: {err}"))
+            },
+        )?;
+
+        let unique_tx_count = {
+            let mut txs: Vec<_> = tx_hash_map.values().collect();
+            txs.sort();
+            txs.dedup();
+            txs.len()
+        };
+        info!("Batch payment successful: {unique_tx_count} on-chain transaction(s) for {chunk_count} chunks");
+
+        prepared
+            .into_iter()
+            .map(|prep| {
+                let chunk_tx_hashes = Self::collect_chunk_tx_hashes(&prep.payment, &tx_hash_map);
+                let proof = PaymentProof {
+                    proof_of_payment: ProofOfPayment {
+                        peer_quotes: prep.peer_quotes,
+                    },
+                    tx_hashes: chunk_tx_hashes.clone(),
+                };
+                let proof_bytes = rmp_serde::to_vec(&proof).map_err(|e| {
+                    Error::Network(format!("Failed to serialize payment proof: {e}"))
+                })?;
+                Ok(PaidChunk {
+                    content: prep.content,
+                    proof_bytes,
+                    tx_hashes: chunk_tx_hashes,
+                    target_peer: prep.target_peer,
+                })
+            })
+            .collect()
+    }
+
+    /// Pay for multiple chunks in a single EVM transaction, then store them.
+    ///
+    /// Convenience wrapper around [`batch_pay`](Self::batch_pay) followed by
+    /// concurrent [`put_chunk_with_proof`](Self::put_chunk_with_proof) calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if payment or any chunk storage fails.
+    pub async fn batch_pay_and_store(
+        &self,
+        prepared: Vec<PreparedChunk>,
+    ) -> Result<Vec<(XorName, Vec<evmlib::common::TxHash>)>> {
+        let chunk_count = prepared.len();
+        let paid_chunks = self.batch_pay(prepared).await?;
+
+        let mut store_futures = FuturesUnordered::new();
+        for (idx, paid) in paid_chunks.into_iter().enumerate() {
+            let tx_hashes = paid.tx_hashes.clone();
+            let target_peer = paid.target_peer;
+            let fut = async move {
+                let address = self
+                    .put_chunk_with_proof(paid.content, paid.proof_bytes, &target_peer)
+                    .await?;
+                Ok::<_, Error>((idx, address, tx_hashes))
+            };
+            store_futures.push(fut);
+        }
+
+        let mut results: Vec<Option<(XorName, Vec<evmlib::common::TxHash>)>> =
+            vec![None; chunk_count];
+        while let Some(result) = store_futures.next().await {
+            let (idx, address, tx_hashes) = result?;
+            results[idx] = Some((address, tx_hashes));
+        }
+
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(i, opt)| {
+                opt.ok_or_else(|| {
+                    Error::Network(format!("Missing store result for chunk index {i}"))
+                })
+            })
+            .collect()
+    }
+
+    /// Extract transaction hashes relevant to a single chunk's payment.
+    fn collect_chunk_tx_hashes(
+        payment: &SingleNodePayment,
+        tx_hash_map: &BTreeMap<ant_evm::QuoteHash, evmlib::common::TxHash>,
+    ) -> Vec<evmlib::common::TxHash> {
+        payment
+            .quotes
+            .iter()
+            .filter(|q| q.amount > Amount::ZERO)
+            .filter_map(|q| tx_hash_map.get(&q.quote_hash).copied())
+            .collect()
     }
 
     /// Store a chunk on the saorsa network.
@@ -570,7 +795,7 @@ impl QuantumClient {
     pub async fn get_quotes_from_dht(
         &self,
         content: &[u8],
-    ) -> Result<Vec<(PeerId, PaymentQuote, Amount)>> {
+    ) -> Result<(PeerId, Vec<(PeerId, PaymentQuote, Amount)>)> {
         let address = compute_address(content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::Network(format!("Content size too large: {e}")))?;
@@ -604,7 +829,7 @@ impl QuantumClient {
         &self,
         address: &XorName,
         data_size: u64,
-    ) -> Result<Vec<(PeerId, PaymentQuote, Amount)>> {
+    ) -> Result<(PeerId, Vec<(PeerId, PaymentQuote, Amount)>)> {
         let Some(ref node) = self.p2p_node else {
             return Err(Error::Network("P2P node not configured".into()));
         };
@@ -666,11 +891,16 @@ impl QuantumClient {
             );
         }
 
+        // Pin the closest peer as the storage target. This peer is always
+        // among the quoted set, so the payment proof will include it.
+        let closest_peer = remote_peers[0];
+
         if tracing::enabled!(tracing::Level::DEBUG) {
             debug!(
-                "Found {} remote peers, requesting quotes from first {}",
+                "Found {} remote peers, requesting quotes from first {} (closest: {})",
                 remote_peers.len(),
-                REQUIRED_QUOTES
+                REQUIRED_QUOTES,
+                closest_peer
             );
         }
 
@@ -781,7 +1011,7 @@ impl QuantumClient {
             info!("Collected {quote_count} quotes for chunk {addr_hex}");
         }
 
-        Ok(quotes_with_peers)
+        Ok((closest_peer, quotes_with_peers))
     }
 }
 

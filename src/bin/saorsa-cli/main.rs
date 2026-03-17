@@ -60,7 +60,7 @@ async fn main() -> color_eyre::Result<()> {
     }
 
     let (bootstrap, manifest) = resolve_bootstrap(&cli)?;
-    let node = create_client_node(bootstrap).await?;
+    let node = create_client_node(bootstrap, cli.allow_loopback).await?;
 
     // Build client with timeout
     let mut client = QuantumClient::new(QuantumConfig {
@@ -309,9 +309,14 @@ fn resolve_evm_network(
 
 fn resolve_bootstrap(
     cli: &Cli,
-) -> color_eyre::Result<(Vec<std::net::SocketAddr>, Option<DevnetManifest>)> {
+) -> color_eyre::Result<(Vec<saorsa_core::MultiAddr>, Option<DevnetManifest>)> {
     if !cli.bootstrap.is_empty() {
-        return Ok((cli.bootstrap.clone(), None));
+        let addrs = cli
+            .bootstrap
+            .iter()
+            .map(|addr| saorsa_core::MultiAddr::quic(*addr))
+            .collect();
+        return Ok((addrs, None));
     }
 
     if let Some(ref manifest_path) = cli.devnet_manifest {
@@ -326,17 +331,17 @@ fn resolve_bootstrap(
     ))
 }
 
-async fn create_client_node(bootstrap: Vec<std::net::SocketAddr>) -> Result<Arc<P2PNode>, Error> {
-    let mut core_config = saorsa_core::NodeConfig::new()
+async fn create_client_node(
+    bootstrap: Vec<saorsa_core::MultiAddr>,
+    allow_loopback: bool,
+) -> Result<Arc<P2PNode>, Error> {
+    let mut core_config = saorsa_core::NodeConfig::builder()
+        .local(allow_loopback)
+        .max_message_size(MAX_WIRE_MESSAGE_SIZE)
+        .mode(saorsa_core::NodeMode::Client)
+        .build()
         .map_err(|e| Error::Config(format!("Failed to create core config: {e}")))?;
-    core_config.listen_addr = "0.0.0.0:0"
-        .parse()
-        .map_err(|e| Error::Config(format!("Invalid listen addr: {e}")))?;
-    core_config.listen_addrs = vec![core_config.listen_addr];
-    core_config.enable_ipv6 = false;
     core_config.bootstrap_peers = bootstrap;
-    core_config.max_message_size = Some(MAX_WIRE_MESSAGE_SIZE);
-    core_config.mode = saorsa_core::NodeMode::Client;
 
     let node = P2PNode::new(core_config)
         .await
