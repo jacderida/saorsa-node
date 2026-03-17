@@ -247,6 +247,126 @@ impl LmdbStorage {
         Ok(true)
     }
 
+    /// Store data at the given address without content-address verification.
+    ///
+    /// Use this for data types where the address is not `BLAKE3(content)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn put_raw(&self, address: &XorName, data: &[u8]) -> Result<bool> {
+        // Fast-path duplicate check
+        if self.exists(address)? {
+            trace!("Record {} already exists", hex::encode(address));
+            self.stats.write().duplicates += 1;
+            return Ok(false);
+        }
+
+        let key = *address;
+        let value = data.to_vec();
+        let env = self.env.clone();
+        let db = self.db;
+        let max_chunks = self.config.max_chunks;
+
+        let was_new = spawn_blocking(move || -> Result<bool> {
+            let mut wtxn = env
+                .write_txn()
+                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+
+            if db
+                .get(&wtxn, &key)
+                .map_err(|e| Error::Storage(format!("Failed to check existence: {e}")))?
+                .is_some()
+            {
+                return Ok(false);
+            }
+
+            if max_chunks > 0 {
+                let current = db
+                    .stat(&wtxn)
+                    .map_err(|e| Error::Storage(format!("Failed to read db stats: {e}")))?
+                    .entries;
+                if current >= max_chunks {
+                    return Err(Error::Storage(format!(
+                        "Storage capacity reached: {current} stored, max is {max_chunks}"
+                    )));
+                }
+            }
+
+            db.put(&mut wtxn, &key, &value)
+                .map_err(|e| Error::Storage(format!("Failed to put record: {e}")))?;
+            wtxn.commit()
+                .map_err(|e| Error::Storage(format!("Failed to commit put: {e}")))?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("LMDB put_raw task failed: {e}")))??;
+
+        if !was_new {
+            trace!("Record {} already exists", hex::encode(address));
+            self.stats.write().duplicates += 1;
+            return Ok(false);
+        }
+
+        {
+            let mut stats = self.stats.write();
+            stats.chunks_stored += 1;
+            stats.bytes_stored += data.len() as u64;
+        }
+
+        debug!(
+            "Stored record {} ({} bytes)",
+            hex::encode(address),
+            data.len()
+        );
+
+        Ok(true)
+    }
+
+    /// Overwrite a record at the given address without content-address verification.
+    ///
+    /// Unlike `put_raw`, this does not check for existing records and will
+    /// overwrite them. Used for mutable data types where
+    /// the handler has already validated the update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    pub async fn put_overwrite(&self, address: &XorName, data: &[u8]) -> Result<()> {
+        let key = *address;
+        let value = data.to_vec();
+        let env = self.env.clone();
+        let db = self.db;
+
+        spawn_blocking(move || -> Result<()> {
+            let mut wtxn = env
+                .write_txn()
+                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+
+            db.put(&mut wtxn, &key, &value)
+                .map_err(|e| Error::Storage(format!("Failed to put record: {e}")))?;
+            wtxn.commit()
+                .map_err(|e| Error::Storage(format!("Failed to commit put: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("LMDB put_overwrite task failed: {e}")))??;
+
+        {
+            let mut stats = self.stats.write();
+            stats.chunks_stored += 1;
+            stats.bytes_stored += data.len() as u64;
+        }
+
+        debug!(
+            "Overwritten record {} ({} bytes)",
+            hex::encode(address),
+            data.len()
+        );
+
+        Ok(())
+    }
+
     /// Retrieve a chunk.
     ///
     /// # Arguments
@@ -307,6 +427,51 @@ impl LmdbStorage {
 
         debug!(
             "Retrieved chunk {} ({} bytes)",
+            hex::encode(address),
+            content.len()
+        );
+
+        Ok(Some(content))
+    }
+
+    /// Retrieve raw data without content-address verification.
+    ///
+    /// Use this for non-chunk data types where the stored bytes are
+    /// serialized records, not raw content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read fails.
+    pub async fn get_raw(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+        let key = *address;
+        let env = self.env.clone();
+        let db = self.db;
+
+        let content = spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let rtxn = env
+                .read_txn()
+                .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+            let value = db
+                .get(&rtxn, &key)
+                .map_err(|e| Error::Storage(format!("Failed to get record: {e}")))?;
+            Ok(value.map(Vec::from))
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("LMDB get_raw task failed: {e}")))??;
+
+        let Some(content) = content else {
+            trace!("Record {} not found", hex::encode(address));
+            return Ok(None);
+        };
+
+        {
+            let mut stats = self.stats.write();
+            stats.chunks_retrieved += 1;
+            stats.bytes_retrieved += content.len() as u64;
+        }
+
+        debug!(
+            "Retrieved record {} ({} bytes)",
             hex::encode(address),
             content.len()
         );

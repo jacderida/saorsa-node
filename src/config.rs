@@ -193,21 +193,11 @@ pub enum EvmNetworkConfig {
 
 /// Payment verification configuration.
 ///
-/// **Production nodes require payment by default.**
-///
-/// All new data requires EVM payment on Arbitrum. The cache stores
-/// previously verified payments to avoid redundant lookups.
-///
-/// To disable payment verification (test/dev only):
-/// - Use CLI flag: `--disable-payment-verification`
-/// - Or set `enabled = false` in config file
+/// All new data requires EVM payment on Arbitrum — there is no way to
+/// disable payment verification. The cache stores previously verified
+/// payments to avoid redundant on-chain lookups.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentConfig {
-    /// Enable payment verification.
-    /// **Default: true (payment required).**
-    #[serde(default = "default_payment_enabled")]
-    pub enabled: bool,
-
     /// Cache capacity for verified `XorNames`.
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: usize,
@@ -230,7 +220,6 @@ pub struct PaymentConfig {
 impl Default for PaymentConfig {
     fn default() -> Self {
         Self {
-            enabled: default_payment_enabled(),
             cache_capacity: default_cache_capacity(),
             rewards_address: None,
             evm_network: EvmNetworkConfig::default(),
@@ -241,10 +230,6 @@ impl Default for PaymentConfig {
 
 const fn default_metrics_port() -> u16 {
     9100
-}
-
-const fn default_payment_enabled() -> bool {
-    true
 }
 
 const fn default_cache_capacity() -> usize {
@@ -511,18 +496,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config_requires_payment() {
+    fn test_default_config_has_cache_capacity() {
         let config = PaymentConfig::default();
-        assert!(config.enabled, "Payment must be enabled by default");
+        assert!(config.cache_capacity > 0, "Cache capacity must be positive");
     }
 
     #[test]
-    fn test_default_evm_verifier_enabled() {
+    fn test_default_evm_network() {
         use crate::payment::EvmVerifierConfig;
-        let config = EvmVerifierConfig::default();
-        assert!(
-            config.enabled,
-            "EVM verification must be enabled by default"
-        );
+        let _config = EvmVerifierConfig::default();
+        // EVM verification is always on — no enabled field
     }
 }

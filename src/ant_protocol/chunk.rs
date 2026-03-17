@@ -227,6 +227,8 @@ pub enum ChunkQuoteResponse {
         /// Serialized `PaymentQuote`.
         quote: Vec<u8>,
     },
+    /// The chunk is already stored on this node — no payment needed.
+    AlreadyStored,
     /// Quote generation failed.
     Error(ProtocolError),
 }

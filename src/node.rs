@@ -12,7 +12,7 @@ use crate::payment::wallet::parse_rewards_address;
 use crate::payment::{EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
-use ant_evm::RewardsAddress;
+
 use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
@@ -34,9 +34,6 @@ use tracing::{debug, error, info, warn};
 /// its maximum record count, giving the pricing algorithm a meaningful
 /// fullness ratio instead of a hardcoded constant.
 pub const NODE_STORAGE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-
-/// Default rewards address when none is configured (20-byte zero address).
-const DEFAULT_REWARDS_ADDRESS: [u8; 20] = [0u8; 20];
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -61,15 +58,6 @@ impl NodeBuilder {
     pub async fn build(mut self) -> Result<RunningNode> {
         info!("Building saorsa-node with config: {:?}", self.config);
 
-        // Validate production requirements
-        if self.config.network_mode == NetworkMode::Production && !self.config.payment.enabled {
-            return Err(Error::Config(
-                "CRITICAL: Payment verification is REQUIRED in production mode. \
-                 Remove 'enabled = false' from config or --disable-payment-verification flag."
-                    .to_string(),
-            ));
-        }
-
         // Validate rewards address in production
         if self.config.network_mode == NetworkMode::Production {
             match self.config.payment.rewards_address {
@@ -89,16 +77,6 @@ impl NodeBuilder {
                 }
                 Some(_) => {}
             }
-        }
-
-        // Warn if payment disabled in any mode
-        if !self.config.payment.enabled {
-            let mode = self.config.network_mode;
-            warn!("⚠️  ⚠️  ⚠️");
-            warn!("⚠️  PAYMENT VERIFICATION DISABLED (mode: {mode:?})");
-            warn!("⚠️  This should ONLY be used for testing!");
-            warn!("⚠️  All storage requests will be accepted for FREE");
-            warn!("⚠️  ⚠️  ⚠️");
         }
 
         // Resolve identity and root_dir (may update self.config.root_dir)
@@ -354,10 +332,14 @@ impl NodeBuilder {
             .await
             .map_err(|e| Error::Startup(format!("Failed to create LMDB storage: {e}")))?;
 
-        // Parse rewards address first (needed by both verifier and quote generator)
+        // Parse rewards address (required — node must know where to receive payments)
         let rewards_address = match config.payment.rewards_address {
             Some(ref addr) => parse_rewards_address(addr)?,
-            None => RewardsAddress::new(DEFAULT_REWARDS_ADDRESS),
+            None => {
+                return Err(Error::Startup(
+                    "No rewards address configured. Set --rewards-address or payment.rewards_address in config.".to_string(),
+                ));
+            }
         };
 
         // Create payment verifier
@@ -367,11 +349,10 @@ impl NodeBuilder {
         };
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
-                enabled: config.payment.enabled,
                 network: evm_network,
             },
             cache_capacity: config.payment.cache_capacity,
-            local_rewards_address: Some(rewards_address),
+            local_rewards_address: rewards_address,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
         // Safe: 5GB fits in usize on all supported 64-bit platforms.
@@ -650,26 +631,37 @@ impl RunningNode {
                     data,
                 } = event
                 {
-                    if topic == CHUNK_PROTOCOL_ID {
-                        debug!("Received chunk protocol message from {source}");
+                    let handler_info: Option<(&str, &str)> = if topic == CHUNK_PROTOCOL_ID {
+                        Some(("chunk", CHUNK_PROTOCOL_ID))
+                    } else {
+                        None
+                    };
+
+                    if let Some((data_type, response_topic)) = handler_info {
+                        debug!("Received {data_type} protocol message from {source}");
                         let protocol = Arc::clone(&protocol);
                         let p2p = Arc::clone(&p2p);
                         let sem = semaphore.clone();
+                        let response_topic = response_topic.to_string();
                         tokio::spawn(async move {
                             let Ok(_permit) = sem.acquire().await else {
                                 return;
                             };
-                            match protocol.handle_message(&data).await {
+                            let result = match data_type {
+                                "chunk" => protocol.handle_message(&data).await,
+                                _ => return,
+                            };
+                            match result {
                                 Ok(response) => {
                                     if let Err(e) = p2p
-                                        .send_message(&source, CHUNK_PROTOCOL_ID, response.to_vec())
+                                        .send_message(&source, &response_topic, response.to_vec())
                                         .await
                                     {
-                                        warn!("Failed to send protocol response to {source}: {e}");
+                                        warn!("Failed to send {data_type} protocol response to {source}: {e}");
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Protocol handler error: {e}");
+                                    warn!("{data_type} protocol handler error: {e}");
                                 }
                             }
                         });

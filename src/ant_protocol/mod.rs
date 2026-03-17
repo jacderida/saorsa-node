@@ -5,12 +5,9 @@
 //!
 //! # Data Types
 //!
-//! The ANT protocol supports multiple data types:
+//! The ANT protocol supports a single data type:
 //!
 //! - **Chunk**: Immutable, content-addressed data (hash == address)
-//! - *Scratchpad*: Mutable, owner-indexed data (planned)
-//! - *Pointer*: Lightweight mutable references (planned)
-//! - *`GraphEntry`*: DAG entries with parent links (planned)
 //!
 //! # Protocol Overview
 //!

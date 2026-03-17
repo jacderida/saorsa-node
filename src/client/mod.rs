@@ -1,67 +1,81 @@
-//! Chunk client module for saorsa-node.
+//! Protocol helpers for saorsa-node client operations.
 //!
-//! This module provides a client interface for content-addressed chunk storage
-//! on the saorsa network using post-quantum cryptography.
+//! This module provides low-level protocol support for client-node communication.
+//! For high-level client operations, use the `saorsa-client` crate instead.
 //!
 //! # Architecture
 //!
-//! The chunk client provides:
+//! This module contains:
 //!
-//! 1. **Content-addressed storage**: Chunk address = BLAKE3(content)
-//! 2. **PQC security**: All data uses ML-KEM-768 and ML-DSA-65
-//! 3. **EVM payment**: Chunks are paid for on Arbitrum network
+//! 1. **Protocol message handlers**: Send/await pattern for chunks
+//! 2. **Data types**: Common types like `XorName`, `DataChunk`, address computation
 //!
-//! # Data Types
+//! # Migration Note
 //!
-//! Currently supports a single data type:
-//!
-//! - **Chunk**: Immutable content-addressed data (hash(value) == key)
-//!
-//! Future extensions may include non-content-addressed key-value storage.
+//! The `QuantumClient` has been deprecated and consolidated into `saorsa-client::Client`.
+//! Use `saorsa-client` for all client operations.
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use saorsa_node::client::{ChunkClient, ChunkConfig};
+//! use saorsa_client::Client; // Use saorsa-client instead of QuantumClient
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Create client with default config
-//!     let client = ChunkClient::with_defaults();
+//!     // High-level client API
+//!     let client = Client::connect(&bootstrap_peers, Default::default()).await?;
 //!
-//!     // Store new data (content-addressed)
-//!     let address = client.put_chunk(bytes::Bytes::from("hello world")).await?;
+//!     // Store data with payment
+//!     let address = client.chunk_put(bytes::Bytes::from("hello world")).await?;
 //!
-//!     // Retrieve data by address
-//!     let data = client.get_chunk(&address).await?;
-//!
-//!     // Check statistics
-//!     let stats = client.stats();
-//!     println!("Chunks stored: {}", stats.chunks_stored);
-//!     println!("Chunks retrieved: {}", stats.chunks_retrieved);
+//!     // Retrieve data
+//!     let chunk = client.chunk_get(&address).await?;
 //!
 //!     Ok(())
 //! }
 //! ```
-//!
-//! # Security Model
-//!
-//! ## Quantum-Resistant Cryptography
-//!
-//! All data stored through this client uses:
-//! - **ML-KEM-768** (NIST FIPS 203): Key encapsulation for encryption
-//! - **ML-DSA-65** (NIST FIPS 204): Digital signatures for authentication
-//! - **ChaCha20-Poly1305**: Symmetric encryption for data at rest
 
 mod chunk_protocol;
 mod data_types;
-mod quantum;
-pub mod self_encrypt;
 
 pub use chunk_protocol::send_and_await_chunk_response;
 pub use data_types::{
     compute_address, peer_id_to_xor_name, xor_distance, ChunkStats, DataChunk, XorName,
 };
-pub use quantum::{
-    hex_node_id_to_encoded_peer_id, PaidChunk, PreparedChunk, QuantumClient, QuantumConfig,
-};
+
+// Re-export hex_node_id_to_encoded_peer_id for payment operations
+use crate::error::{Error, Result};
+use ant_evm::EncodedPeerId;
+
+/// Identity multihash code (stores raw bytes without hashing).
+const MULTIHASH_IDENTITY_CODE: u64 = 0x00;
+
+/// Convert a hex-encoded 32-byte saorsa-core node ID to an [`EncodedPeerId`].
+///
+/// Saorsa-core peer IDs are 64-character hex strings representing 32 raw bytes.
+/// libp2p `PeerId` expects a multihash-encoded identity. This function bridges the two
+/// formats by wrapping the raw bytes in an identity multihash (code 0x00) and then
+/// converting to `EncodedPeerId` via `From<PeerId>`.
+///
+/// # Errors
+///
+/// Returns an error if the hex string is invalid or the peer ID cannot be constructed.
+pub fn hex_node_id_to_encoded_peer_id(hex_id: &str) -> Result<EncodedPeerId> {
+    let raw_bytes = hex::decode(hex_id)
+        .map_err(|e| Error::Payment(format!("Invalid hex peer ID '{hex_id}': {e}")))?;
+
+    let multihash =
+        multihash::Multihash::<64>::wrap(MULTIHASH_IDENTITY_CODE, &raw_bytes).map_err(|e| {
+            Error::Payment(format!(
+                "Failed to create multihash for peer '{hex_id}': {e}"
+            ))
+        })?;
+
+    let peer_id = libp2p::PeerId::from_multihash(multihash).map_err(|_| {
+        Error::Payment(format!(
+            "Failed to create PeerId from multihash for peer '{hex_id}'"
+        ))
+    })?;
+
+    Ok(EncodedPeerId::from(peer_id))
+}

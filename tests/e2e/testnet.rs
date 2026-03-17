@@ -15,7 +15,6 @@
 
 use ant_evm::RewardsAddress;
 use bytes::Bytes;
-use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
 use futures::future::join_all;
 use rand::Rng;
@@ -28,9 +27,9 @@ use saorsa_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, CHUNK_PROTOCOL_ID,
 };
-use saorsa_node::client::{send_and_await_chunk_response, DataChunk, QuantumClient, XorName};
+use saorsa_node::client::{send_and_await_chunk_response, DataChunk, XorName};
 use saorsa_node::payment::{
-    EvmVerifierConfig, PaymentProof, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
+    EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
 use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
@@ -40,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, Instant};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 // =============================================================================
@@ -368,12 +367,6 @@ pub struct TestNode {
     /// ANT protocol handler (`AntProtocol`) for processing chunk PUT/GET requests.
     pub ant_protocol: Option<Arc<AntProtocol>>,
 
-    /// `QuantumClient` for payment-enabled operations.
-    pub client: Option<Arc<QuantumClient>>,
-
-    /// EVM wallet for payment operations.
-    pub wallet: Option<Wallet>,
-
     /// Is this a bootstrap node?
     pub is_bootstrap: bool,
 
@@ -398,152 +391,6 @@ pub struct TestNode {
 }
 
 impl TestNode {
-    /// Set wallet for payment tests.
-    ///
-    /// This updates the node's wallet and creates a new `QuantumClient` configured
-    /// with both the P2P node and wallet for payment-enabled operations.
-    pub fn set_wallet(&mut self, wallet: Wallet) {
-        // Create a new QuantumClient with the P2P node and wallet if available
-        if let Some(ref p2p_node) = self.p2p_node {
-            let client = QuantumClient::with_defaults()
-                .with_node(Arc::clone(p2p_node))
-                .with_wallet(wallet.clone());
-            self.client = Some(Arc::new(client));
-        }
-
-        self.wallet = Some(wallet);
-    }
-
-    /// Store a chunk using the `QuantumClient` (with payment).
-    ///
-    /// This is the payment-enabled variant that uses the `QuantumClient` to handle
-    /// quote requests, payments, and chunk storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the client is not configured or the store operation fails.
-    pub async fn store_chunk_with_payment(&self, data: &[u8]) -> Result<XorName> {
-        let client = self.client.as_ref().ok_or(TestnetError::NodeNotRunning)?;
-        let data_bytes = Bytes::from(data.to_vec());
-
-        let mut last_err = String::new();
-        for attempt in 1..=5 {
-            match client.put_chunk(data_bytes.clone()).await {
-                Ok(addr) => return Ok(addr),
-                Err(e) => {
-                    last_err = format!("Client PUT error: {e}");
-                    if attempt < 5 {
-                        warn!("store_chunk_with_payment attempt {attempt}/5 failed: {e}");
-                        sleep(Duration::from_secs(3)).await;
-                    }
-                }
-            }
-        }
-
-        Err(TestnetError::Storage(last_err))
-    }
-
-    /// Store a chunk with payment tracking.
-    ///
-    /// This method stores a chunk using the payment-enabled client and records
-    /// the payment transaction to the provided tracker. This allows tests to
-    /// verify payment behavior (e.g., that caching prevents duplicate payments).
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - The chunk data to store
-    /// * `tracker` - Payment tracker to record transactions
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the client/wallet is not configured or the store operation fails.
-    pub async fn store_chunk_with_tracked_payment(
-        &self,
-        data: &[u8],
-        tracker: &super::harness::PaymentTracker,
-    ) -> Result<XorName> {
-        use saorsa_node::payment::SingleNodePayment;
-
-        // Reuse the client created by set_wallet()
-        let client = self.client.as_ref().ok_or_else(|| {
-            TestnetError::Storage(
-                "Client not configured - use set_wallet() to create a payment-enabled client"
-                    .to_string(),
-            )
-        })?;
-        let wallet = self.wallet.as_ref().ok_or_else(|| {
-            TestnetError::Storage("Wallet not configured - use set_wallet()".to_string())
-        })?;
-
-        // Compute the chunk address
-        let address = Self::compute_chunk_address(data);
-
-        // Get quotes from the network (includes peer IDs for proof of payment).
-        // The target_peer is the closest peer pinned during quoting — we store to
-        // this peer to guarantee the storage target was paid.
-        let (target_peer, quotes_with_peers) = client
-            .get_quotes_from_dht(data)
-            .await
-            .map_err(|e| TestnetError::Storage(format!("Failed to get quotes: {e}")))?;
-
-        // Collect peer_quotes and strip peer IDs for SingleNodePayment
-        let mut peer_quotes: Vec<_> = Vec::with_capacity(quotes_with_peers.len());
-        let mut quotes_with_prices: Vec<_> = Vec::with_capacity(quotes_with_peers.len());
-        for (peer_id_str, quote, price) in quotes_with_peers {
-            let encoded_peer_id =
-                saorsa_node::client::hex_node_id_to_encoded_peer_id(&peer_id_str.to_hex())
-                    .map_err(|e| {
-                        TestnetError::Storage(format!(
-                            "Failed to convert peer ID '{peer_id_str}': {e}"
-                        ))
-                    })?;
-            peer_quotes.push((encoded_peer_id, quote.clone()));
-            quotes_with_prices.push((quote, price));
-        }
-
-        // Create payment structure (sorts by price, selects median)
-        let payment = SingleNodePayment::from_quotes(quotes_with_prices)
-            .map_err(|e| TestnetError::Storage(format!("Failed to create payment: {e}")))?;
-
-        // Make the payment and get transaction hashes
-        let tx_hashes = payment
-            .pay(wallet)
-            .await
-            .map_err(|e| TestnetError::Storage(format!("Payment failed: {e}")))?;
-
-        // Record the payment in the tracker
-        tracker.record_payment(address, tx_hashes.clone());
-
-        // Build proof AFTER payment with tx hashes included
-        let proof = PaymentProof {
-            proof_of_payment: ant_evm::ProofOfPayment { peer_quotes },
-            tx_hashes,
-        };
-        let proof_bytes = rmp_serde::to_vec(&proof)
-            .map_err(|e| TestnetError::Storage(format!("Failed to serialize proof: {e}")))?;
-
-        // Use put_chunk_with_proof to send the pre-built proof, avoiding a
-        // redundant quote+pay cycle that put_chunk_with_payment would perform.
-        client
-            .put_chunk_with_proof(Bytes::from(data.to_vec()), proof_bytes, &target_peer)
-            .await
-            .map_err(|e| TestnetError::Storage(format!("Client PUT error: {e}")))
-    }
-
-    /// Retrieve a chunk using the `QuantumClient`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the client is not configured or the retrieval fails.
-    pub async fn get_chunk_with_client(&self, address: &XorName) -> Result<Option<DataChunk>> {
-        let client = self.client.as_ref().ok_or(TestnetError::NodeNotRunning)?;
-
-        client
-            .get_chunk(address)
-            .await
-            .map_err(|e| TestnetError::Retrieval(format!("Client GET error: {e}")))
-    }
-
     /// Check if this node is running.
     pub async fn is_running(&self) -> bool {
         matches!(
@@ -567,9 +414,6 @@ impl TestNode {
         if let Some(handle) = self.protocol_task.take() {
             handle.abort();
         }
-
-        // Drop client to release its Arc<P2PNode> reference
-        self.client = None;
 
         *self.state.write().await = NodeState::Stopping;
 
@@ -627,9 +471,10 @@ impl TestNode {
         // Compute content address
         let address = Self::compute_chunk_address(data);
 
-        // Create PUT request WITHOUT payment proof (EVM disabled in tests)
-        // When EVM verification is disabled, we send None instead of an empty proof
-        // to avoid triggering the fail-secure rejection in PaymentVerifier
+        // Pre-populate payment cache so the handler accepts the store
+        // without an on-chain proof.
+        protocol.payment_verifier().cache_insert(address);
+
         let request_id: u64 = rand::thread_rng().gen();
         let request = ChunkPutRequest::new(address, data.to_vec());
         let message = ChunkMessage {
@@ -1156,13 +1001,9 @@ impl TestNetwork {
         })?);
 
         // Initialize AntProtocol for this node with payment enforcement setting
-        let ant_protocol = Self::create_ant_protocol(
-            &data_dir,
-            self.config.payment_enforcement,
-            self.config.evm_network.clone(),
-            &identity,
-        )
-        .await?;
+        let ant_protocol =
+            Self::create_ant_protocol(&data_dir, self.config.evm_network.clone(), &identity)
+                .await?;
 
         Ok(TestNode {
             index,
@@ -1171,8 +1012,6 @@ impl TestNetwork {
             data_dir,
             p2p_node: None,
             ant_protocol: Some(Arc::new(ant_protocol)),
-            client: None,
-            wallet: None,
             is_bootstrap,
             state: Arc::new(RwLock::new(NodeState::Pending)),
             bootstrap_addrs,
@@ -1198,7 +1037,6 @@ impl TestNetwork {
     /// Returns an error if LMDB storage initialisation fails.
     pub async fn create_ant_protocol(
         data_dir: &std::path::Path,
-        payment_enforcement: bool,
         evm_network: Option<EvmNetwork>,
         identity: &saorsa_core::identity::NodeIdentity,
     ) -> Result<AntProtocol> {
@@ -1213,21 +1051,20 @@ impl TestNetwork {
             .await
             .map_err(|e| TestnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
 
-        // Create payment verifier with EVM enabled/disabled based on test config.
-        // When payment_enforcement is true and an EVM network is provided,
-        // use that network (e.g. Anvil) for on-chain verification.
+        // Create payment verifier (EVM is always on).
+        // When an EVM network is provided (e.g. Anvil), use it for on-chain verification.
+        // Otherwise default to ArbitrumSepoliaTest for test nodes.
+        let rewards_address = RewardsAddress::new(TEST_REWARDS_ADDRESS);
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
-                enabled: payment_enforcement,
                 network: evm_network.unwrap_or(EvmNetwork::ArbitrumSepoliaTest),
             },
             cache_capacity: TEST_PAYMENT_CACHE_CAPACITY,
-            local_rewards_address: None,
+            local_rewards_address: rewards_address,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
 
         // Create quote generator with ML-DSA-65 signing from the test node's identity
-        let rewards_address = RewardsAddress::new(TEST_REWARDS_ADDRESS);
         let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS, TEST_INITIAL_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
@@ -1262,6 +1099,7 @@ impl TestNetwork {
     }
 
     /// Start a single node.
+    #[allow(clippy::too_many_lines)]
     async fn start_node(&mut self, mut node: TestNode) -> Result<()> {
         debug!("Starting node {} on port {}", node.index, node.port);
         *node.state.write().await = NodeState::Starting;
@@ -1327,12 +1165,14 @@ impl TestNetwork {
                                             .await
                                         {
                                             warn!(
-                                                "Node {node_index} failed to send response to {source}: {e}"
+                                                "Node {node_index} failed to send chunk response to {source}: {e}"
                                             );
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("Node {node_index} protocol handler error: {e}");
+                                        warn!(
+                                            "Node {node_index} chunk protocol handler error: {e}"
+                                        );
                                     }
                                 }
                             });

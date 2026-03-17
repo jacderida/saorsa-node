@@ -578,29 +578,20 @@ impl Devnet {
             .await
             .map_err(|e| DevnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
 
-        let evm_config = if config.enable_evm {
-            EvmVerifierConfig {
-                enabled: true,
-                network: config
-                    .evm_network
-                    .clone()
-                    .unwrap_or(EvmNetwork::ArbitrumOne),
-            }
-        } else {
-            EvmVerifierConfig {
-                enabled: false,
-                ..Default::default()
-            }
+        let evm_config = EvmVerifierConfig {
+            network: config
+                .evm_network
+                .clone()
+                .unwrap_or(EvmNetwork::ArbitrumOne),
         };
 
+        let rewards_address = RewardsAddress::new(DEVNET_REWARDS_ADDRESS);
         let payment_config = PaymentVerifierConfig {
             evm: evm_config,
             cache_capacity: DEVNET_PAYMENT_CACHE_CAPACITY,
-            local_rewards_address: None,
+            local_rewards_address: rewards_address,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
-
-        let rewards_address = RewardsAddress::new(DEVNET_REWARDS_ADDRESS);
         let metrics_tracker =
             QuotingMetricsTracker::new(DEVNET_MAX_RECORDS, DEVNET_INITIAL_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);

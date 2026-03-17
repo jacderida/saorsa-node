@@ -54,12 +54,8 @@ pub use ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE,
 };
-pub use client::self_encrypt::{
-    deserialize_data_map, download_and_decrypt_file, encrypt_and_upload_file,
-    fetch_data_map_public, serialize_data_map, store_data_map_public,
-};
 pub use client::{
-    compute_address, peer_id_to_xor_name, xor_distance, DataChunk, QuantumClient, QuantumConfig,
+    compute_address, hex_node_id_to_encoded_peer_id, peer_id_to_xor_name, xor_distance, DataChunk,
     XorName,
 };
 pub use config::{BootstrapCacheConfig, NodeConfig, StorageConfig};
@@ -69,3 +65,10 @@ pub use event::{NodeEvent, NodeEventsChannel};
 pub use node::{NodeBuilder, RunningNode};
 pub use payment::{PaymentStatus, PaymentVerifier, PaymentVerifierConfig};
 pub use storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+
+/// Re-exports from `saorsa-core` so downstream crates (e.g. `saorsa-client`)
+/// can depend on `saorsa-node` alone without a direct `saorsa-core` dependency.
+pub mod core {
+    pub use saorsa_core::identity::PeerId;
+    pub use saorsa_core::{NodeConfig as CoreNodeConfig, NodeMode, P2PNode};
+}

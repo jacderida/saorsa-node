@@ -372,13 +372,11 @@ mod tests {
         }
 
         // Recreate AntProtocol from the same data directory (simulates restart)
-        // Pass false for payment_enforcement (disabled for this test)
         let restart_identity = saorsa_core::identity::NodeIdentity::generate()
             .expect("Failed to generate identity for restart");
-        let new_protocol =
-            TestNetwork::create_ant_protocol(&data_dir, false, None, &restart_identity)
-                .await
-                .expect("Failed to recreate AntProtocol");
+        let new_protocol = TestNetwork::create_ant_protocol(&data_dir, None, &restart_identity)
+            .await
+            .expect("Failed to recreate AntProtocol");
         {
             let node = harness
                 .network_mut()
@@ -413,207 +411,6 @@ mod tests {
             .expect("Failed to teardown harness");
     }
 
-    // =========================================================================
-    // Payment E2E Tests
-    // =========================================================================
-
-    /// Test: Store chunk with payment (full E2E flow).
-    ///
-    /// This test validates the complete pay-to-store workflow:
-    /// 1. Starts a test network with Anvil EVM testnet
-    /// 2. Creates a funded wallet from Anvil
-    /// 3. Configures a client node with the wallet
-    /// 4. Stores a chunk (triggers quote request, payment, and storage)
-    /// 5. Retrieves and verifies the chunk
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial]
-    async fn test_chunk_store_with_payment() {
-        let mut harness = TestHarness::setup_with_payments()
-            .await
-            .expect("Failed to setup harness with payments");
-
-        // Get wallet from Anvil
-        let anvil = harness.anvil().expect("Anvil should be running");
-        let wallet = anvil
-            .create_funded_wallet()
-            .expect("Failed to create funded wallet");
-
-        // Setup client with wallet
-        let client_node = harness.test_node_mut(0).expect("Node 0 should exist");
-        client_node.set_wallet(wallet);
-
-        let fixture = ChunkTestFixture::new();
-
-        // Store chunk - should request quotes, pay, and store
-        let address = harness
-            .test_node(0)
-            .expect("Node 0 should exist")
-            .store_chunk_with_payment(&fixture.small)
-            .await
-            .expect("Failed to store chunk with payment");
-
-        // Verify the address matches the content hash
-        let expected_address = ChunkTestFixture::compute_address(&fixture.small);
-        assert_eq!(
-            address, expected_address,
-            "Returned address should match computed content address"
-        );
-
-        // Verify chunk was stored by retrieving it
-        let retrieved = harness
-            .test_node(0)
-            .expect("Node 0 should exist")
-            .get_chunk_with_client(&address)
-            .await
-            .expect("Failed to retrieve chunk");
-
-        let chunk = retrieved.expect("Chunk should exist after payment");
-        assert_eq!(
-            chunk.content.as_ref(),
-            fixture.small.as_slice(),
-            "Retrieved data should match original"
-        );
-
-        harness
-            .teardown()
-            .await
-            .expect("Failed to teardown harness");
-    }
-
-    /// Test: Payment cache works (second PUT is free).
-    ///
-    /// This test verifies that storing the same chunk twice doesn't require
-    /// a second payment (the first payment is cached).
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial]
-    async fn test_chunk_payment_cache() {
-        let mut harness = TestHarness::setup_with_payments()
-            .await
-            .expect("Failed to setup harness");
-
-        let anvil = harness.anvil().expect("Anvil should be running");
-        let wallet = anvil
-            .create_funded_wallet()
-            .expect("Failed to create wallet");
-
-        harness
-            .test_node_mut(0)
-            .expect("Node 0 should exist")
-            .set_wallet(wallet);
-
-        let fixture = ChunkTestFixture::new();
-
-        // First store - pays
-        let address1 = harness
-            .test_node(0)
-            .expect("Node 0 should exist")
-            .store_chunk_with_payment(&fixture.small)
-            .await
-            .expect("Failed to store chunk first time");
-
-        // Second store of same data - should return same address
-        // Note: The chunk already exists, so the node will return AlreadyExists
-        let address2 = harness
-            .test_node(0)
-            .expect("Node 0 should exist")
-            .store_chunk_with_payment(&fixture.small)
-            .await
-            .expect("Failed to store chunk second time");
-
-        assert_eq!(
-            address1, address2,
-            "Same data should produce same address both times"
-        );
-
-        harness
-            .teardown()
-            .await
-            .expect("Failed to teardown harness");
-    }
-
-    /// Test: Store fails without wallet.
-    ///
-    /// This test verifies that attempting to store a chunk without configuring
-    /// a wallet results in an appropriate error.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_chunk_store_fails_without_wallet() {
-        let harness = TestHarness::setup_minimal()
-            .await
-            .expect("Failed to setup harness");
-
-        // Client without wallet - use the test node without calling with_wallet()
-        let client_node = harness.test_node(0).expect("Node 0 should exist");
-        let fixture = ChunkTestFixture::new();
-
-        // This should fail because no client is configured (no wallet means no client)
-        let result = client_node.store_chunk_with_payment(&fixture.small).await;
-
-        assert!(
-            result.is_err(),
-            "Store should fail without client/wallet configured"
-        );
-
-        harness
-            .teardown()
-            .await
-            .expect("Failed to teardown harness");
-    }
-
-    /// Test: Store fails with insufficient funds.
-    ///
-    /// This test verifies that attempting to store a chunk with an empty wallet
-    /// (no balance) results in a payment failure.
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial]
-    async fn test_chunk_store_fails_with_insufficient_funds() {
-        let mut harness = TestHarness::setup_with_payments()
-            .await
-            .expect("Failed to setup harness");
-
-        // Create wallet with 0 balance
-        let anvil = harness.anvil().expect("Anvil should be running");
-        let wallet = anvil
-            .create_empty_wallet()
-            .expect("Failed to create empty wallet");
-
-        harness
-            .test_node_mut(0)
-            .expect("Node 0 should exist")
-            .set_wallet(wallet);
-
-        let fixture = ChunkTestFixture::new();
-
-        // Should fail with insufficient funds error
-        let result = harness
-            .test_node(0)
-            .expect("Node 0 should exist")
-            .store_chunk_with_payment(&fixture.small)
-            .await;
-
-        assert!(result.is_err(), "Store should fail with insufficient funds");
-
-        // Verify the error is related to payment/funds
-        if let Err(e) = result {
-            let error_msg = format!("{e}");
-            assert!(
-                {
-                    let lower = error_msg.to_lowercase();
-                    lower.contains("payment")
-                        || lower.contains("pay")
-                        || lower.contains("funds")
-                        || lower.contains("balance")
-                        || lower.contains("insufficient")
-                },
-                "Error should mention payment or funds, got: {error_msg}"
-            );
-        }
-
-        harness
-            .teardown()
-            .await
-            .expect("Failed to teardown harness");
-    }
-
     /// Create an `AntProtocol` with EVM verification enabled, backed by an Anvil testnet.
     ///
     /// Returns (protocol, `temp_dir`, testnet). The testnet must be kept alive for the
@@ -635,16 +432,12 @@ mod tests {
         })
         .await?;
 
-        let payment_verifier = PaymentVerifier::new(PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
-                enabled: true,
-                network,
-            },
-            cache_capacity: 100,
-            local_rewards_address: None,
-        });
-
         let rewards_address = RewardsAddress::new([0x01; 20]);
+        let payment_verifier = PaymentVerifier::new(PaymentVerifierConfig {
+            evm: EvmVerifierConfig { network },
+            cache_capacity: 100,
+            local_rewards_address: rewards_address,
+        });
         let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
         let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 

@@ -231,6 +231,19 @@ impl AntProtocol {
         let data_size = request.data_size;
         debug!("Handling quote request for {addr_hex} (size: {data_size})");
 
+        // If the chunk is already stored, no payment is needed
+        match self.storage.exists(&request.address) {
+            Ok(true) => {
+                debug!("Chunk {addr_hex} already stored — returning AlreadyStored");
+                return ChunkQuoteResponse::AlreadyStored;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!("Storage check failed for {addr_hex}: {e}");
+                // Fall through to generate a quote anyway
+            }
+        }
+
         // Validate data size - data_size is u64, cast carefully and reject overflow
         let Ok(data_size_usize) = usize::try_from(request.data_size) else {
             return ChunkQuoteResponse::Error(ProtocolError::ChunkTooLarge {
@@ -272,6 +285,12 @@ impl AntProtocol {
     #[must_use]
     pub fn payment_cache_stats(&self) -> crate::payment::CacheStats {
         self.payment_verifier.cache_stats()
+    }
+
+    /// Get a reference to the payment verifier.
+    #[must_use]
+    pub fn payment_verifier(&self) -> &PaymentVerifier {
+        &self.payment_verifier
     }
 
     /// Check if a chunk exists locally.
@@ -330,17 +349,13 @@ mod tests {
                 .expect("create storage"),
         );
 
+        let rewards_address = RewardsAddress::new([1u8; 20]);
         let payment_config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
-                enabled: false, // Disable EVM for tests
-                ..Default::default()
-            },
-            cache_capacity: 100,
-            local_rewards_address: None,
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 100_000,
+            local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
-
-        let rewards_address = RewardsAddress::new([1u8; 20]);
         let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
         let quote_generator = Arc::new(QuoteGenerator::new(rewards_address, metrics_tracker));
 
@@ -355,7 +370,9 @@ mod tests {
         let content = b"hello world";
         let address = LmdbStorage::compute_address(content);
 
-        // Create PUT request - no payment proof needed (EVM disabled in test)
+        // Pre-populate payment cache so EVM verification is bypassed
+        protocol.payment_verifier().cache_insert(address);
+
         let put_request = ChunkPutRequest::new(address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 1,
@@ -442,7 +459,9 @@ mod tests {
         let content = b"test content";
         let wrong_address = [0xFF; 32]; // Wrong address
 
-        // No payment proof needed (EVM disabled in test)
+        // Pre-populate cache for the wrong address so we test address mismatch, not payment
+        protocol.payment_verifier().cache_insert(wrong_address);
+
         let put_request = ChunkPutRequest::new(wrong_address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 20,
@@ -506,7 +525,9 @@ mod tests {
         let content = b"duplicate content";
         let address = LmdbStorage::compute_address(content);
 
-        // Store first time - no payment proof needed (EVM disabled in test)
+        // Pre-populate cache so EVM verification is bypassed
+        protocol.payment_verifier().cache_insert(address);
+
         let put_request = ChunkPutRequest::new(address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 40,
@@ -563,17 +584,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_populates_payment_cache() {
+    async fn test_cache_insert_is_visible() {
         let (protocol, _temp) = create_test_protocol().await;
 
         let content = b"cache test content";
         let address = LmdbStorage::compute_address(content);
 
-        // Before PUT: cache should be empty
+        // Before insert: cache should be empty
         let stats_before = protocol.payment_cache_stats();
         assert_eq!(stats_before.additions, 0);
 
-        // PUT (EVM disabled — verifier will auto-accept and cache)
+        // Pre-populate cache
+        protocol.payment_verifier().cache_insert(address);
+
+        // After insert: cache should have the xorname
+        let stats_after = protocol.payment_cache_stats();
+        assert_eq!(stats_after.additions, 1);
+
+        // PUT should succeed (cache hit)
         let put_request = ChunkPutRequest::new(address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 100,
@@ -591,10 +619,6 @@ mod tests {
         } else {
             panic!("expected success, got: {response:?}");
         }
-
-        // After PUT: cache should have the xorname
-        let stats_after = protocol.payment_cache_stats();
-        assert_eq!(stats_after.additions, 1);
     }
 
     #[tokio::test]
@@ -603,6 +627,9 @@ mod tests {
 
         let content = b"duplicate cache test";
         let address = LmdbStorage::compute_address(content);
+
+        // Pre-populate cache for first PUT
+        protocol.payment_verifier().cache_insert(address);
 
         // First PUT
         let put_request = ChunkPutRequest::new(address, content.to_vec());
@@ -640,9 +667,11 @@ mod tests {
         assert_eq!(stats.misses, 0);
         assert_eq!(stats.additions, 0);
 
-        // Store a chunk to trigger payment verification
+        // Pre-populate cache, then store a chunk to test stats
         let content = b"stats test";
         let address = LmdbStorage::compute_address(content);
+        protocol.payment_verifier().cache_insert(address);
+
         let put_request = ChunkPutRequest::new(address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 120,
@@ -655,9 +684,9 @@ mod tests {
             .expect("handle put");
 
         let stats = protocol.payment_cache_stats();
-        // Should have 1 miss (first lookup) + 1 addition (after verify)
-        assert_eq!(stats.misses, 1);
+        // Should have 1 addition (from cache_insert) + 1 hit (payment verification found cache)
         assert_eq!(stats.additions, 1);
+        assert_eq!(stats.hits, 1);
     }
 
     #[tokio::test]

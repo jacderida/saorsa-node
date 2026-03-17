@@ -344,6 +344,28 @@ impl TestHarness {
         self.network.node_mut(index)
     }
 
+    /// Pre-populate the payment cache on the node matching `peer_id`.
+    ///
+    /// Inserts `address` into the target node's payment verifier cache so
+    /// P2P store requests are accepted without an on-chain proof. This
+    /// simulates the address having been previously paid for.
+    pub fn prepopulate_payment_cache_for_peer(
+        &self,
+        peer_id: &saorsa_core::identity::PeerId,
+        address: &XorName,
+    ) {
+        for node in self.network.nodes() {
+            if let Some(ref p2p) = node.p2p_node {
+                if p2p.peer_id() == peer_id {
+                    if let Some(ref protocol) = node.ant_protocol {
+                        protocol.payment_verifier().cache_insert(*address);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     /// Get a random non-bootstrap node.
     ///
     /// Useful for tests that need to pick an arbitrary regular node.

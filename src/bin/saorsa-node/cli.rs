@@ -42,10 +42,6 @@ pub struct Cli {
     )]
     pub upgrade_channel: CliUpgradeChannel,
 
-    /// Disable payment verification.
-    #[arg(long)]
-    pub disable_payment_verification: bool,
-
     /// Cache capacity for verified `XorName` values.
     #[arg(long, default_value = "100000", env = "SAORSA_CACHE_CAPACITY")]
     pub cache_capacity: usize,
@@ -218,9 +214,8 @@ impl Cli {
             ..config.upgrade
         };
 
-        // Payment config
+        // Payment config (payment verification is always on)
         config.payment = PaymentConfig {
-            enabled: !self.disable_payment_verification,
             cache_capacity: self.cache_capacity,
             rewards_address: self.rewards_address,
             evm_network: self.evm_network.into(),
