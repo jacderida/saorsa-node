@@ -265,7 +265,7 @@ pub async fn encrypt_and_upload_file(
 /// Store a single paid chunk on the network.
 async fn store_paid_chunk(client: &QuantumClient, paid: PaidChunk) -> Result<ChunkAddress> {
     client
-        .put_chunk_with_proof(paid.content, paid.proof_bytes)
+        .put_chunk_with_proof(paid.content, paid.proof_bytes, &paid.target_peer)
         .await
 }
 

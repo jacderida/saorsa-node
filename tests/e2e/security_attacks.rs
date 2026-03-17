@@ -263,23 +263,29 @@ async fn test_attack_proof_too_large() -> Result<(), Box<dyn std::error::Error>>
 // ===========================================================================
 
 /// Helper: get quotes from DHT with retries (up to 5 attempts, exponential backoff).
+///
+/// Returns the target peer (closest to the chunk address, pinned during quoting)
+/// alongside the quotes.
 async fn get_quotes_with_retries(
     client: &QuantumClient,
     test_data: &[u8],
 ) -> Result<
-    Vec<(
+    (
         saorsa_core::identity::PeerId,
-        ant_evm::PaymentQuote,
-        ant_evm::Amount,
-    )>,
+        Vec<(
+            saorsa_core::identity::PeerId,
+            ant_evm::PaymentQuote,
+            ant_evm::Amount,
+        )>,
+    ),
     String,
 > {
     let mut last_err = String::new();
     for attempt in 1..=5u32 {
         match client.get_quotes_from_dht(test_data).await {
-            Ok(quotes) => {
+            Ok((target_peer, quotes)) => {
                 info!("Got {} quotes on attempt {attempt}", quotes.len());
-                return Ok(quotes);
+                return Ok((target_peer, quotes));
             }
             Err(e) => {
                 last_err = format!("{e}");
@@ -340,7 +346,7 @@ async fn test_attack_forged_ml_dsa_signature() -> Result<(), Box<dyn std::error:
         .with_wallet(wallet.clone());
 
     let test_data = b"Attack: forge all ML-DSA signatures";
-    let quotes = get_quotes_with_retries(&client, test_data).await?;
+    let (target_peer, quotes) = get_quotes_with_retries(&client, test_data).await?;
 
     // Build peer_quotes and payment
     let mut peer_quotes = Vec::with_capacity(quotes.len());
@@ -377,7 +383,7 @@ async fn test_attack_forged_ml_dsa_signature() -> Result<(), Box<dyn std::error:
 
     // Try to store with forged proof
     let result = client
-        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), forged_bytes)
+        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), forged_bytes, &target_peer)
         .await;
 
     assert!(
@@ -407,13 +413,17 @@ async fn test_attack_wrong_chunk_address() -> Result<(), Box<dyn std::error::Err
 
     // Get quotes and pay for chunk A
     let chunk_a_data = b"Attack: this is chunk A with valid payment";
-    let quotes = get_quotes_with_retries(&client, chunk_a_data).await?;
+    let (target_peer, quotes) = get_quotes_with_retries(&client, chunk_a_data).await?;
     let (proof_bytes_a, _tx_hashes) = build_valid_proof(quotes, &wallet).await?;
 
     // Try to store chunk B using chunk A's proof
     let chunk_b_data = b"Attack: this is chunk B, using A's proof";
     let result = client
-        .put_chunk_with_proof(Bytes::from(chunk_b_data.to_vec()), proof_bytes_a)
+        .put_chunk_with_proof(
+            Bytes::from(chunk_b_data.to_vec()),
+            proof_bytes_a,
+            &target_peer,
+        )
         .await;
 
     assert!(
@@ -443,14 +453,18 @@ async fn test_attack_replay_different_chunk() -> Result<(), Box<dyn std::error::
 
     // Legitimately upload chunk A
     let chunk_a_data = b"Attack: legitimate chunk A for replay test";
-    let quotes = get_quotes_with_retries(&client, chunk_a_data).await?;
+    let (target_peer, quotes) = get_quotes_with_retries(&client, chunk_a_data).await?;
     let (proof_bytes_a, _tx_hashes) = build_valid_proof(quotes, &wallet).await?;
 
     // Store chunk A (should succeed) — retry for slow DHT on CI
     let mut chunk_a_stored = false;
     for attempt in 1..=5u32 {
         match client
-            .put_chunk_with_proof(Bytes::from(chunk_a_data.to_vec()), proof_bytes_a.clone())
+            .put_chunk_with_proof(
+                Bytes::from(chunk_a_data.to_vec()),
+                proof_bytes_a.clone(),
+                &target_peer,
+            )
             .await
         {
             Ok(_addr) => {
@@ -475,7 +489,11 @@ async fn test_attack_replay_different_chunk() -> Result<(), Box<dyn std::error::
     // Now replay A's proof for chunk B
     let chunk_b_data = b"Attack: trying to replay A's proof for chunk B";
     let result_b = client
-        .put_chunk_with_proof(Bytes::from(chunk_b_data.to_vec()), proof_bytes_a)
+        .put_chunk_with_proof(
+            Bytes::from(chunk_b_data.to_vec()),
+            proof_bytes_a,
+            &target_peer,
+        )
         .await;
 
     assert!(
@@ -504,7 +522,7 @@ async fn test_attack_zero_amount_payment() -> Result<(), Box<dyn std::error::Err
         .with_wallet(wallet.clone());
 
     let test_data = b"Attack: quotes but no payment";
-    let quotes = get_quotes_with_retries(&client, test_data).await?;
+    let (target_peer, quotes) = get_quotes_with_retries(&client, test_data).await?;
 
     // Build peer_quotes from real quotes but skip on-chain payment
     let mut peer_quotes = Vec::with_capacity(quotes.len());
@@ -523,7 +541,7 @@ async fn test_attack_zero_amount_payment() -> Result<(), Box<dyn std::error::Err
         rmp_serde::to_vec(&unpaid_proof).map_err(|e| format!("Serialize failed: {e}"))?;
 
     let result = client
-        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes)
+        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes, &target_peer)
         .await;
 
     assert!(
@@ -552,7 +570,7 @@ async fn test_attack_fabricated_tx_hash() -> Result<(), Box<dyn std::error::Erro
         .with_wallet(wallet.clone());
 
     let test_data = b"Attack: fabricated tx hash";
-    let quotes = get_quotes_with_retries(&client, test_data).await?;
+    let (target_peer, quotes) = get_quotes_with_retries(&client, test_data).await?;
 
     // Build peer_quotes from real quotes
     let mut peer_quotes = Vec::with_capacity(quotes.len());
@@ -573,7 +591,7 @@ async fn test_attack_fabricated_tx_hash() -> Result<(), Box<dyn std::error::Erro
         rmp_serde::to_vec(&fake_proof).map_err(|e| format!("Serialize failed: {e}"))?;
 
     let result = client
-        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes)
+        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes, &target_peer)
         .await;
 
     assert!(
@@ -607,14 +625,18 @@ async fn test_attack_double_spend_same_proof() -> Result<(), Box<dyn std::error:
         .with_wallet(wallet.clone());
 
     let test_data = b"Attack: double-spend same proof";
-    let quotes = get_quotes_with_retries(&client, test_data).await?;
+    let (target_peer, quotes) = get_quotes_with_retries(&client, test_data).await?;
     let (proof_bytes, _tx_hashes) = build_valid_proof(quotes, &wallet).await?;
 
     // First store: should succeed — retry for slow DHT on CI
     let mut first_stored = false;
     for attempt in 1..=5u32 {
         match client
-            .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes.clone())
+            .put_chunk_with_proof(
+                Bytes::from(test_data.to_vec()),
+                proof_bytes.clone(),
+                &target_peer,
+            )
             .await
         {
             Ok(_addr) => {
@@ -638,7 +660,7 @@ async fn test_attack_double_spend_same_proof() -> Result<(), Box<dyn std::error:
 
     // Second store with same proof: should return AlreadyExists (idempotent)
     let result2 = client
-        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes)
+        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes, &target_peer)
         .await;
 
     // AlreadyExists is returned as Ok (it's idempotent success), proving the chunk
@@ -674,7 +696,7 @@ async fn test_attack_corrupted_public_key() -> Result<(), Box<dyn std::error::Er
         .with_wallet(wallet.clone());
 
     let test_data = b"Attack: corrupted public key";
-    let quotes = get_quotes_with_retries(&client, test_data).await?;
+    let (target_peer, quotes) = get_quotes_with_retries(&client, test_data).await?;
 
     // Build peer_quotes and payment
     let mut peer_quotes = Vec::with_capacity(quotes.len());
@@ -709,7 +731,7 @@ async fn test_attack_corrupted_public_key() -> Result<(), Box<dyn std::error::Er
         rmp_serde::to_vec(&corrupted_proof).map_err(|e| format!("Serialize failed: {e}"))?;
 
     let result = client
-        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes)
+        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes, &target_peer)
         .await;
 
     assert!(

@@ -478,8 +478,10 @@ impl TestNode {
         // Compute the chunk address
         let address = Self::compute_chunk_address(data);
 
-        // Get quotes from the network (includes peer IDs for proof of payment)
-        let quotes_with_peers = client
+        // Get quotes from the network (includes peer IDs for proof of payment).
+        // The target_peer is the closest peer pinned during quoting — we store to
+        // this peer to guarantee the storage target was paid.
+        let (target_peer, quotes_with_peers) = client
             .get_quotes_from_dht(data)
             .await
             .map_err(|e| TestnetError::Storage(format!("Failed to get quotes: {e}")))?;
@@ -523,7 +525,7 @@ impl TestNode {
         // Use put_chunk_with_proof to send the pre-built proof, avoiding a
         // redundant quote+pay cycle that put_chunk_with_payment would perform.
         client
-            .put_chunk_with_proof(Bytes::from(data.to_vec()), proof_bytes)
+            .put_chunk_with_proof(Bytes::from(data.to_vec()), proof_bytes, &target_peer)
             .await
             .map_err(|e| TestnetError::Storage(format!("Client PUT error: {e}")))
     }

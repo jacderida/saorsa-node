@@ -60,6 +60,9 @@ pub struct PreparedChunk {
     pub peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>,
     /// The payment structure (sorted quotes, median selected).
     pub payment: SingleNodePayment,
+    /// The closest peer to the chunk address, pinned during quote collection
+    /// so that the storage target is always one of the paid peers.
+    pub target_peer: PeerId,
 }
 
 /// A chunk that has been paid on-chain but not yet stored on the network.
@@ -73,6 +76,9 @@ pub struct PaidChunk {
     pub proof_bytes: Vec<u8>,
     /// Transaction hashes from this chunk's on-chain payment.
     pub tx_hashes: Vec<evmlib::common::TxHash>,
+    /// The closest peer to the chunk address, pinned during quote collection
+    /// so that the storage target is always one of the paid peers.
+    pub target_peer: PeerId,
 }
 
 /// Configuration for the quantum-resistant client.
@@ -307,8 +313,9 @@ impl QuantumClient {
         let data_size = u64::try_from(content_size)
             .map_err(|e| Error::Network(format!("Content size too large: {e}")))?;
 
-        // Step 1: Request quotes from network nodes via DHT
-        let quotes_with_peers = self
+        // Step 1: Request quotes from network nodes via DHT.
+        // The closest peer is pinned here so we store to a peer that was paid.
+        let (target_peer, quotes_with_peers) = self
             .get_quotes_from_dht_for_address(&address, data_size)
             .await?;
 
@@ -355,9 +362,7 @@ impl QuantumClient {
         let payment_proof = rmp_serde::to_vec(&proof)
             .map_err(|e| Error::Network(format!("Failed to serialize payment proof: {e}")))?;
 
-        // Step 6: Send chunk with payment proof to storage node
-        let target_peer = Self::pick_target_peer(node, &address).await?;
-
+        // Step 6: Send chunk with payment proof to the peer pinned during quoting
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = ChunkPutRequest::with_payment(address, content.to_vec(), payment_proof);
         let message = ChunkMessage {
@@ -384,13 +389,16 @@ impl QuantumClient {
 
     /// Store a chunk with a pre-built payment proof, skipping the internal payment flow.
     ///
-    /// Use this when you have already obtained quotes and paid on-chain externally
-    /// (e.g. via [`SingleNodePayment::pay`]) and want to avoid a redundant payment cycle.
+    /// The `target_peer` should be the peer pinned during quote collection so that
+    /// the storage target is guaranteed to be one of the paid peers. Use the
+    /// `target_peer` field from [`PaidChunk`] or the first element returned by
+    /// [`get_quotes_from_dht`].
     ///
     /// # Arguments
     ///
     /// * `content` - The data to store
     /// * `proof` - A serialised [`ProofOfPayment`] (msgpack bytes)
+    /// * `target_peer` - The peer to send the chunk to (pinned during quoting)
     ///
     /// # Returns
     ///
@@ -400,17 +408,19 @@ impl QuantumClient {
     ///
     /// Returns an error if:
     /// - P2P node is not configured
-    /// - No remote peers found near the target address
     /// - Storage operation fails
-    pub async fn put_chunk_with_proof(&self, content: Bytes, proof: Vec<u8>) -> Result<XorName> {
+    pub async fn put_chunk_with_proof(
+        &self,
+        content: Bytes,
+        proof: Vec<u8>,
+        target_peer: &PeerId,
+    ) -> Result<XorName> {
         let Some(ref node) = self.p2p_node else {
             return Err(Error::Network("P2P node not configured".into()));
         };
 
         let address = compute_address(&content);
         let content_size = content.len();
-
-        let target_peer = Self::pick_target_peer(node, &address).await?;
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let request = ChunkPutRequest::with_payment(address, content.to_vec(), proof);
@@ -424,7 +434,7 @@ impl QuantumClient {
 
         Self::send_put_and_await(
             node,
-            &target_peer,
+            target_peer,
             message_bytes,
             request_id,
             self.config.timeout_secs,
@@ -461,7 +471,7 @@ impl QuantumClient {
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::Network(format!("Content size too large: {e}")))?;
 
-        let quotes_with_peers = self
+        let (target_peer, quotes_with_peers) = self
             .get_quotes_from_dht_for_address(&address, data_size)
             .await?;
 
@@ -490,6 +500,7 @@ impl QuantumClient {
             address,
             peer_quotes,
             payment,
+            target_peer,
         })
     }
 
@@ -556,6 +567,7 @@ impl QuantumClient {
                     content: prep.content,
                     proof_bytes,
                     tx_hashes: chunk_tx_hashes,
+                    target_peer: prep.target_peer,
                 })
             })
             .collect()
@@ -579,9 +591,10 @@ impl QuantumClient {
         let mut store_futures = FuturesUnordered::new();
         for (idx, paid) in paid_chunks.into_iter().enumerate() {
             let tx_hashes = paid.tx_hashes.clone();
+            let target_peer = paid.target_peer;
             let fut = async move {
                 let address = self
-                    .put_chunk_with_proof(paid.content, paid.proof_bytes)
+                    .put_chunk_with_proof(paid.content, paid.proof_bytes, &target_peer)
                     .await?;
                 Ok::<_, Error>((idx, address, tx_hashes))
             };
@@ -783,7 +796,7 @@ impl QuantumClient {
     pub async fn get_quotes_from_dht(
         &self,
         content: &[u8],
-    ) -> Result<Vec<(PeerId, PaymentQuote, Amount)>> {
+    ) -> Result<(PeerId, Vec<(PeerId, PaymentQuote, Amount)>)> {
         let address = compute_address(content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::Network(format!("Content size too large: {e}")))?;
@@ -817,7 +830,7 @@ impl QuantumClient {
         &self,
         address: &XorName,
         data_size: u64,
-    ) -> Result<Vec<(PeerId, PaymentQuote, Amount)>> {
+    ) -> Result<(PeerId, Vec<(PeerId, PaymentQuote, Amount)>)> {
         let Some(ref node) = self.p2p_node else {
             return Err(Error::Network("P2P node not configured".into()));
         };
@@ -879,11 +892,16 @@ impl QuantumClient {
             );
         }
 
+        // Pin the closest peer as the storage target. This peer is always
+        // among the quoted set, so the payment proof will include it.
+        let closest_peer = remote_peers[0];
+
         if tracing::enabled!(tracing::Level::DEBUG) {
             debug!(
-                "Found {} remote peers, requesting quotes from first {}",
+                "Found {} remote peers, requesting quotes from first {} (closest: {})",
                 remote_peers.len(),
-                REQUIRED_QUOTES
+                REQUIRED_QUOTES,
+                closest_peer
             );
         }
 
@@ -994,7 +1012,7 @@ impl QuantumClient {
             info!("Collected {quote_count} quotes for chunk {addr_hex}");
         }
 
-        Ok(quotes_with_peers)
+        Ok((closest_peer, quotes_with_peers))
     }
 }
 

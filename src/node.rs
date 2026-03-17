@@ -199,7 +199,7 @@ impl NodeBuilder {
                 core_config.allow_loopback = true;
                 let mut diversity = CoreDiversityConfig::testnet();
                 diversity.max_nodes_per_asn = config.testnet.max_nodes_per_asn;
-                diversity.max_nodes_per_64 = config.testnet.max_nodes_per_64;
+                diversity.max_nodes_per_ipv6_64 = config.testnet.max_nodes_per_64;
                 diversity.enable_geolocation_check = config.testnet.enable_geo_checks;
                 diversity.min_geographic_diversity = if config.testnet.enable_geo_checks {
                     3

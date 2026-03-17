@@ -456,7 +456,7 @@ async fn test_quote_collection_via_dht() -> Result<(), Box<dyn std::error::Error
     info!("Requesting quotes for {} bytes", test_data.len());
 
     // Request quotes from DHT peers
-    let quotes_with_prices = client.get_quotes_from_dht(test_data).await?;
+    let (_target_peer, quotes_with_prices) = client.get_quotes_from_dht(test_data).await?;
 
     // Validate we got exactly 5 quotes (REQUIRED_QUOTES)
     assert_eq!(
