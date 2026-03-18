@@ -39,6 +39,7 @@
 mod anvil;
 mod data_types;
 mod harness;
+#[allow(clippy::missing_errors_doc, clippy::match_same_arms)]
 mod testnet;
 
 #[cfg(test)]

@@ -164,13 +164,9 @@ pub struct DevnetConfig {
     /// Whether to remove the data directory on shutdown.
     pub cleanup_data_dir: bool,
 
-    /// Enable EVM payment enforcement on all nodes.
-    /// When true, nodes will require valid on-chain payment proofs.
-    pub enable_evm: bool,
-
     /// Optional EVM network for payment verification.
-    /// When `enable_evm` is true and this is `Some`, nodes will use
-    /// this network (e.g. Anvil testnet) for on-chain verification.
+    /// When `Some`, nodes will use this network (e.g. Anvil testnet) for
+    /// on-chain verification. Defaults to Arbitrum One when `None`.
     pub evm_network: Option<EvmNetwork>,
 }
 
@@ -192,7 +188,6 @@ impl Default for DevnetConfig {
             node_startup_timeout: Duration::from_secs(DEFAULT_NODE_STARTUP_TIMEOUT_SECS),
             enable_node_logging: false,
             cleanup_data_dir: true,
-            enable_evm: false,
             evm_network: None,
         }
     }
@@ -578,29 +573,20 @@ impl Devnet {
             .await
             .map_err(|e| DevnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
 
-        let evm_config = if config.enable_evm {
-            EvmVerifierConfig {
-                enabled: true,
-                network: config
-                    .evm_network
-                    .clone()
-                    .unwrap_or(EvmNetwork::ArbitrumOne),
-            }
-        } else {
-            EvmVerifierConfig {
-                enabled: false,
-                ..Default::default()
-            }
+        let evm_config = EvmVerifierConfig {
+            network: config
+                .evm_network
+                .clone()
+                .unwrap_or(EvmNetwork::ArbitrumOne),
         };
 
+        let rewards_address = RewardsAddress::new(DEVNET_REWARDS_ADDRESS);
         let payment_config = PaymentVerifierConfig {
             evm: evm_config,
             cache_capacity: DEVNET_PAYMENT_CACHE_CAPACITY,
-            local_rewards_address: None,
+            local_rewards_address: rewards_address,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
-
-        let rewards_address = RewardsAddress::new(DEVNET_REWARDS_ADDRESS);
         let metrics_tracker =
             QuotingMetricsTracker::new(DEVNET_MAX_RECORDS, DEVNET_INITIAL_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
@@ -635,7 +621,9 @@ impl Devnet {
         .map_err(|e| DevnetError::Core(format!("Failed to load node identity: {e}")))?;
 
         core_config.node_identity = Some(Arc::new(identity));
-        core_config.bootstrap_peers = node.bootstrap_addrs.clone();
+        core_config
+            .bootstrap_peers
+            .clone_from(&node.bootstrap_addrs);
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
         let index = node.index;

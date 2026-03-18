@@ -38,19 +38,19 @@ const QUOTE_MAX_AGE_SECS: u64 = 86_400;
 const QUOTE_CLOCK_SKEW_TOLERANCE_SECS: u64 = 60;
 
 /// Configuration for EVM payment verification.
+///
+/// EVM verification is always on. All new data requires on-chain
+/// payment verification. The network field selects which EVM chain to use.
 #[derive(Debug, Clone)]
 pub struct EvmVerifierConfig {
     /// EVM network to use (Arbitrum One, Arbitrum Sepolia, etc.)
     pub network: EvmNetwork,
-    /// Whether EVM verification is enabled.
-    pub enabled: bool,
 }
 
 impl Default for EvmVerifierConfig {
     fn default() -> Self {
         Self {
             network: EvmNetwork::ArbitrumOne,
-            enabled: true,
         }
     }
 }
@@ -66,18 +66,8 @@ pub struct PaymentVerifierConfig {
     /// Cache capacity (number of `XorName` values to cache).
     pub cache_capacity: usize,
     /// Local node's rewards address.
-    /// When set, the verifier rejects payments that don't include this node as a recipient.
-    pub local_rewards_address: Option<RewardsAddress>,
-}
-
-impl Default for PaymentVerifierConfig {
-    fn default() -> Self {
-        Self {
-            evm: EvmVerifierConfig::default(),
-            cache_capacity: 100_000,
-            local_rewards_address: None,
-        }
-    }
+    /// The verifier rejects payments that don't include this node as a recipient.
+    pub local_rewards_address: RewardsAddress,
 }
 
 /// Status returned by payment verification.
@@ -124,8 +114,7 @@ impl PaymentVerifier {
         let cache = VerifiedCache::with_capacity(config.cache_capacity);
 
         let cache_capacity = config.cache_capacity;
-        let evm_enabled = config.evm.enabled;
-        info!("Payment verifier initialized (cache_capacity={cache_capacity}, evm_enabled={evm_enabled})");
+        info!("Payment verifier initialized (cache_capacity={cache_capacity}, evm=always-on)");
 
         Self { cache, config }
     }
@@ -196,19 +185,7 @@ impl PaymentVerifier {
                 Ok(status)
             }
             PaymentStatus::PaymentRequired => {
-                // Test/devnet mode: EVM disabled - accept with or without proof
-                if !self.config.evm.enabled {
-                    if tracing::enabled!(tracing::Level::DEBUG) {
-                        debug!(
-                            "Test mode: Allowing storage without EVM verification (EVM disabled): {}",
-                            hex::encode(xorname)
-                        );
-                    }
-                    self.cache.insert(*xorname);
-                    return Ok(PaymentStatus::PaymentVerified);
-                }
-
-                // Production mode: EVM enabled - verify the proof
+                // EVM verification is always on — verify the proof
                 if let Some(proof) = payment_proof {
                     let proof_len = proof.len();
                     if proof_len < MIN_PAYMENT_PROOF_SIZE_BYTES {
@@ -264,15 +241,19 @@ impl PaymentVerifier {
         self.cache.len()
     }
 
-    /// Check if EVM verification is enabled.
-    #[must_use]
-    pub fn evm_enabled(&self) -> bool {
-        self.config.evm.enabled
+    /// Pre-populate the payment cache for a given address.
+    ///
+    /// This marks the address as already paid, so subsequent `verify_payment`
+    /// calls will return `CachedAsVerified` without on-chain verification.
+    /// Useful for test setups where real EVM payment is not needed.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn cache_insert(&self, xorname: XorName) {
+        self.cache.insert(xorname);
     }
 
     /// Verify an EVM payment proof.
     ///
-    /// This is production-only verification that ALWAYS validates payment proofs.
+    /// This verification ALWAYS validates payment proofs on-chain.
     /// It verifies that:
     /// 1. All quotes target the correct content address (xorname binding)
     /// 2. All quote ML-DSA-65 signatures are valid (offloaded to a blocking
@@ -280,16 +261,15 @@ impl PaymentVerifier {
     ///    is CPU-intensive)
     /// 3. The payment was made on-chain via the EVM payment vault contract
     ///
-    /// Test environments should disable EVM at the `verify_payment` level,
-    /// not bypass verification here.
+    /// For unit tests that don't need on-chain verification, pre-populate
+    /// the cache so `verify_payment` returns `CachedAsVerified` before
+    /// reaching this method.
     async fn verify_evm_payment(&self, xorname: &XorName, payment: &ProofOfPayment) -> Result<()> {
         if tracing::enabled!(tracing::Level::DEBUG) {
             let xorname_hex = hex::encode(xorname);
             let quote_count = payment.peer_quotes.len();
             debug!("Verifying EVM payment for {xorname_hex} with {quote_count} quotes");
         }
-
-        debug_assert!(self.config.evm.enabled);
 
         Self::validate_quote_structure(payment)?;
         Self::validate_quote_content(payment, xorname)?;
@@ -445,16 +425,15 @@ impl PaymentVerifier {
 
     /// Verify this node is among the paid recipients.
     fn validate_local_recipient(&self, payment: &ProofOfPayment) -> Result<()> {
-        if let Some(ref local_addr) = self.config.local_rewards_address {
-            let is_recipient = payment
-                .peer_quotes
-                .iter()
-                .any(|(_, quote)| quote.rewards_address == *local_addr);
-            if !is_recipient {
-                return Err(Error::Payment(
-                    "Payment proof does not include this node as a recipient".to_string(),
-                ));
-            }
+        let local_addr = &self.config.local_rewards_address;
+        let is_recipient = payment
+            .peer_quotes
+            .iter()
+            .any(|(_, quote)| quote.rewards_address == *local_addr);
+        if !is_recipient {
+            return Err(Error::Payment(
+                "Payment proof does not include this node as a recipient".to_string(),
+            ));
         }
         Ok(())
     }
@@ -465,26 +444,13 @@ impl PaymentVerifier {
 mod tests {
     use super::*;
 
+    /// Create a verifier for unit tests. EVM is always on, but tests can
+    /// pre-populate the cache to bypass on-chain verification.
     fn create_test_verifier() -> PaymentVerifier {
         let config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
-                enabled: false, // Disabled for tests
-                ..Default::default()
-            },
+            evm: EvmVerifierConfig::default(),
             cache_capacity: 100,
-            local_rewards_address: None,
-        };
-        PaymentVerifier::new(config)
-    }
-
-    fn create_evm_enabled_verifier() -> PaymentVerifier {
-        let config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
-                enabled: true,
-                network: EvmNetwork::ArbitrumOne,
-            },
-            cache_capacity: 100,
-            local_rewards_address: None,
+            local_rewards_address: RewardsAddress::new([1u8; 20]),
         };
         PaymentVerifier::new(config)
     }
@@ -513,40 +479,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verify_payment_without_proof() {
+    async fn test_verify_payment_without_proof_rejected() {
         let verifier = create_test_verifier();
         let xorname = [1u8; 32];
 
-        // Test mode (EVM disabled): Should SUCCEED without payment proof
-        // This allows tests to run without needing real EVM payments
+        // No proof provided => should return an error (EVM is always on)
         let result = verifier.verify_payment(&xorname, None).await;
-        assert!(result.is_ok(), "Expected Ok in test mode, got: {result:?}");
-        assert_eq!(
-            result.expect("should succeed"),
-            PaymentStatus::PaymentVerified
-        );
-    }
-
-    #[tokio::test]
-    async fn test_verify_payment_with_proof() {
-        let verifier = create_test_verifier();
-        let xorname = [1u8; 32];
-
-        // Create a properly-sized proof
-        let proof = ProofOfPayment {
-            peer_quotes: vec![],
-        };
-        let mut proof_bytes = rmp_serde::to_vec(&proof).expect("should serialize");
-        // Pad to minimum required size to pass validation
-        proof_bytes.resize(MIN_PAYMENT_PROOF_SIZE_BYTES, 0);
-
-        // EVM disabled (test/devnet mode): should SUCCEED even with a proof present.
-        // When EVM is disabled, the verifier skips on-chain checks and accepts storage.
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
-        assert!(result.is_ok(), "Expected Ok in test mode, got: {result:?}");
-        assert_eq!(
-            result.expect("should succeed"),
-            PaymentStatus::PaymentVerified
+        assert!(
+            result.is_err(),
+            "Expected Err without proof, got: {result:?}"
         );
     }
 
@@ -555,7 +496,7 @@ mod tests {
         let verifier = create_test_verifier();
         let xorname = [1u8; 32];
 
-        // Add to cache
+        // Add to cache — simulates previously-paid data
         verifier.cache.insert(xorname);
 
         // Should succeed without payment (cached)
@@ -579,7 +520,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verifier_caches_after_successful_verification() {
+    async fn test_cache_preload_bypasses_evm() {
         let verifier = create_test_verifier();
         let xorname = [42u8; 32];
 
@@ -589,10 +530,8 @@ mod tests {
             PaymentStatus::PaymentRequired
         );
 
-        // Verify payment (EVM disabled, so it succeeds and caches)
-        let result = verifier.verify_payment(&xorname, None).await;
-        assert!(result.is_ok());
-        assert_eq!(result.expect("verified"), PaymentStatus::PaymentVerified);
+        // Pre-populate cache (simulates a previous successful payment)
+        verifier.cache.insert(xorname);
 
         // Now the xorname should be cached
         assert_eq!(
@@ -602,18 +541,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_verifier_rejects_without_proof_when_evm_enabled() {
-        let verifier = create_evm_enabled_verifier();
-        let xorname = [99u8; 32];
-
-        // EVM enabled + no proof provided => should return an error
-        let result = verifier.verify_payment(&xorname, None).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_proof_too_small() {
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [1u8; 32];
 
         // Proof smaller than MIN_PAYMENT_PROOF_SIZE_BYTES
@@ -629,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proof_too_large() {
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [2u8; 32];
 
         // Proof larger than MAX_PAYMENT_PROOF_SIZE_BYTES
@@ -645,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proof_at_min_boundary() {
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [3u8; 32];
 
         // Exactly MIN_PAYMENT_PROOF_SIZE_BYTES — passes size check, but
@@ -664,7 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_proof_at_max_boundary() {
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [4u8; 32];
 
         // Exactly MAX_PAYMENT_PROOF_SIZE_BYTES — passes size check, but
@@ -683,7 +612,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_malformed_msgpack_proof() {
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [5u8; 32];
 
         // Valid size but garbage bytes — should fail deserialization
@@ -692,15 +621,6 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
         assert!(err_msg.contains("deserialize"));
-    }
-
-    #[test]
-    fn test_evm_enabled_getter() {
-        let verifier = create_test_verifier();
-        assert!(!verifier.evm_enabled());
-
-        let verifier = create_evm_enabled_verifier();
-        assert!(verifier.evm_enabled());
     }
 
     #[test]
@@ -736,10 +656,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_verify_payment() {
+    async fn test_concurrent_cache_lookups() {
         let verifier = std::sync::Arc::new(create_test_verifier());
-        let mut handles = Vec::new();
 
+        // Pre-populate cache for all 10 xornames
+        for i in 0..10u8 {
+            verifier.cache.insert([i; 32]);
+        }
+
+        let mut handles = Vec::new();
         for i in 0..10u8 {
             let v = verifier.clone();
             handles.push(tokio::spawn(async move {
@@ -751,23 +676,16 @@ mod tests {
         for handle in handles {
             let result = handle.await.expect("task panicked");
             assert!(result.is_ok());
+            assert_eq!(result.expect("cached"), PaymentStatus::CachedAsVerified);
         }
 
-        // All 10 should be cached
         assert_eq!(verifier.cache_len(), 10);
     }
 
     #[test]
-    fn test_default_config() {
-        let config = PaymentVerifierConfig::default();
-        assert!(config.evm.enabled);
-        assert_eq!(config.cache_capacity, 100_000);
-    }
-
-    #[test]
     fn test_default_evm_config() {
-        let config = EvmVerifierConfig::default();
-        assert!(config.enabled);
+        let _config = EvmVerifierConfig::default();
+        // EVM is always on — default network is ArbitrumOne
     }
 
     #[test]
@@ -837,7 +755,7 @@ mod tests {
         use libp2p::PeerId;
         use std::time::SystemTime;
 
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
 
         // The xorname we're trying to store
         let target_xorname = [0xAAu8; 32];
@@ -937,7 +855,7 @@ mod tests {
         use ant_evm::{EncodedPeerId, RewardsAddress};
         use std::time::Duration;
 
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [0xCCu8; 32];
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
@@ -968,7 +886,7 @@ mod tests {
         use ant_evm::{EncodedPeerId, RewardsAddress};
         use std::time::Duration;
 
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [0xDDu8; 32];
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
@@ -999,7 +917,7 @@ mod tests {
         use ant_evm::{EncodedPeerId, RewardsAddress};
         use std::time::Duration;
 
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [0xD1u8; 32];
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
@@ -1030,7 +948,7 @@ mod tests {
         use ant_evm::{EncodedPeerId, RewardsAddress};
         use std::time::Duration;
 
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [0xD2u8; 32];
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
@@ -1064,7 +982,7 @@ mod tests {
         use ant_evm::{EncodedPeerId, RewardsAddress};
         use std::time::Duration;
 
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [0xD3u8; 32];
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
@@ -1115,11 +1033,10 @@ mod tests {
         let local_addr = RewardsAddress::new([0xAAu8; 20]);
         let config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
-                enabled: true,
                 network: EvmNetwork::ArbitrumOne,
             },
             cache_capacity: 100,
-            local_rewards_address: Some(local_addr),
+            local_rewards_address: local_addr,
         };
         let verifier = PaymentVerifier::new(config);
 
@@ -1158,7 +1075,7 @@ mod tests {
         use saorsa_core::MlDsa65;
         use saorsa_pqc::pqc::MlDsaOperations;
 
-        let verifier = create_evm_enabled_verifier();
+        let verifier = create_test_verifier();
         let xorname = [0xFFu8; 32];
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 

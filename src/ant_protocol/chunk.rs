@@ -223,9 +223,15 @@ impl ChunkQuoteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChunkQuoteResponse {
     /// Quote generated successfully.
+    ///
+    /// When `already_stored` is `true` the node already holds this chunk and no
+    /// payment is required — the client should skip the pay-then-PUT cycle for
+    /// this address. The quote is still included for informational purposes.
     Success {
         /// Serialized `PaymentQuote`.
         quote: Vec<u8>,
+        /// `true` when the chunk already exists on this node (skip payment).
+        already_stored: bool,
     },
     /// Quote generation failed.
     Error(ProtocolError),

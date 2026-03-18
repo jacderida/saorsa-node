@@ -16,11 +16,7 @@ pub fn compute_address(content: &[u8]) -> XorName {
 /// Lexicographic comparison of the result gives correct Kademlia distance ordering.
 #[must_use]
 pub fn xor_distance(a: &XorName, b: &XorName) -> XorName {
-    let mut result = [0u8; 32];
-    for i in 0..32 {
-        result[i] = a[i] ^ b[i];
-    }
-    result
+    std::array::from_fn(|i| a[i] ^ b[i])
 }
 
 /// Convert a hex-encoded peer ID string to an `XorName`.

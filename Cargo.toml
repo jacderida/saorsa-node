@@ -1,6 +1,6 @@
 [package]
 name = "saorsa-node"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Saorsa decentralized network"
@@ -26,10 +26,6 @@ path = "src/bin/keygen.rs"
 name = "saorsa-devnet"
 path = "src/bin/saorsa-devnet/main.rs"
 
-[[bin]]
-name = "saorsa-cli"
-path = "src/bin/saorsa-cli/main.rs"
-
 [dependencies]
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.17"
@@ -53,11 +49,7 @@ heed = "0.22"
 aes-gcm-siv = "0.11"
 hkdf = "0.12"
 
-# Self-encryption (convergent encryption + streaming)
-# Branch name "post_quatum" is intentional (matches the upstream branch).
-self_encryption = { git = "https://github.com/grumbach/self_encryption.git", branch = "post_quatum" }
-
-# Hashing (aligned with saorsa-core)
+self_encryption = "0.35.0"
 blake3 = "1"
 
 # Async runtime
@@ -110,15 +102,19 @@ proptest = "1"
 alloy = { version = "1", features = ["node-bindings"] }
 serial_test = "3"
 
-# E2E test infrastructure
+# E2E test infrastructure (run with --features test-utils)
 [[test]]
 name = "e2e"
 path = "tests/e2e/mod.rs"
+required-features = ["test-utils"]
 
 [features]
 default = []
 # Enable additional diagnostics for development
 dev = []
+# Expose test helpers (cache_insert, payment_verifier accessor) for
+# integration tests and downstream test harnesses.
+test-utils = []
 
 [profile.release]
 lto = true

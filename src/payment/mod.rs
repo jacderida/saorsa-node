@@ -8,10 +8,8 @@
 //!
 //! **Production nodes require payment by default.**
 //!
-//! - `PaymentVerifierConfig::default()` has `evm.enabled = true`
-//! - `PaymentConfig::default()` has `enabled = true`
-//! - Test environments can disable via CLI flag `--disable-payment-verification`
-//! - Test utilities explicitly disable EVM verification for unit tests
+//! - EVM verification is always on — there is no way to disable it
+//! - For unit tests, pre-populate the cache via `PaymentVerifier::cache_insert()`
 //!
 //! # Architecture
 //!

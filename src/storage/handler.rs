@@ -231,6 +231,20 @@ impl AntProtocol {
         let data_size = request.data_size;
         debug!("Handling quote request for {addr_hex} (size: {data_size})");
 
+        // Check if the chunk is already stored so we can tell the client
+        // to skip payment (already_stored = true).
+        let already_stored = match self.storage.exists(&request.address) {
+            Ok(exists) => exists,
+            Err(e) => {
+                warn!("Storage check failed for {addr_hex}: {e}");
+                false // Assume not stored on error — generate a normal quote.
+            }
+        };
+
+        if already_stored {
+            debug!("Chunk {addr_hex} already stored — returning quote with already_stored=true");
+        }
+
         // Validate data size - data_size is u64, cast carefully and reject overflow
         let Ok(data_size_usize) = usize::try_from(request.data_size) else {
             return ChunkQuoteResponse::Error(ProtocolError::ChunkTooLarge {
@@ -252,7 +266,10 @@ impl AntProtocol {
             Ok(quote) => {
                 // Serialize the quote
                 match rmp_serde::to_vec(&quote) {
-                    Ok(quote_bytes) => ChunkQuoteResponse::Success { quote: quote_bytes },
+                    Ok(quote_bytes) => ChunkQuoteResponse::Success {
+                        quote: quote_bytes,
+                        already_stored,
+                    },
                     Err(e) => ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(format!(
                         "Failed to serialize quote: {e}"
                     ))),
@@ -272,6 +289,17 @@ impl AntProtocol {
     #[must_use]
     pub fn payment_cache_stats(&self) -> crate::payment::CacheStats {
         self.payment_verifier.cache_stats()
+    }
+
+    /// Get a reference to the payment verifier.
+    ///
+    /// Exposed for **test harnesses only** — production code should not call
+    /// this directly. Use `cache_insert()` on the returned verifier to
+    /// pre-populate the payment cache in test setups.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn payment_verifier(&self) -> &PaymentVerifier {
+        &self.payment_verifier
     }
 
     /// Check if a chunk exists locally.
@@ -313,6 +341,9 @@ mod tests {
     use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
     use crate::storage::LmdbStorageConfig;
     use ant_evm::RewardsAddress;
+    use saorsa_core::identity::NodeIdentity;
+    use saorsa_core::MlDsa65;
+    use saorsa_pqc::pqc::types::MlDsaSecretKey;
     use tempfile::TempDir;
 
     async fn create_test_protocol() -> (AntProtocol, TempDir) {
@@ -330,21 +361,30 @@ mod tests {
                 .expect("create storage"),
         );
 
+        let rewards_address = RewardsAddress::new([1u8; 20]);
         let payment_config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
-                enabled: false, // Disable EVM for tests
-                ..Default::default()
-            },
-            cache_capacity: 100,
-            local_rewards_address: None,
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 100_000,
+            local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
-
-        let rewards_address = RewardsAddress::new([1u8; 20]);
         let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
-        let quote_generator = Arc::new(QuoteGenerator::new(rewards_address, metrics_tracker));
+        let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
-        let protocol = AntProtocol::new(storage, payment_verifier, quote_generator);
+        // Wire ML-DSA-65 signing so quote requests succeed
+        let identity = NodeIdentity::generate().expect("generate identity");
+        let pub_key_bytes = identity.public_key().as_bytes().to_vec();
+        let sk_bytes = identity.secret_key_bytes().to_vec();
+        let sk = MlDsaSecretKey::from_bytes(&sk_bytes).expect("deserialize secret key");
+        quote_generator.set_signer(pub_key_bytes, move |msg| {
+            use saorsa_pqc::pqc::MlDsaOperations;
+            let ml_dsa = MlDsa65::new();
+            ml_dsa
+                .sign(&sk, msg)
+                .map_or_else(|_| vec![], |sig| sig.as_bytes().to_vec())
+        });
+
+        let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator));
         (protocol, temp_dir)
     }
 
@@ -355,7 +395,9 @@ mod tests {
         let content = b"hello world";
         let address = LmdbStorage::compute_address(content);
 
-        // Create PUT request - no payment proof needed (EVM disabled in test)
+        // Pre-populate payment cache so EVM verification is bypassed
+        protocol.payment_verifier().cache_insert(address);
+
         let put_request = ChunkPutRequest::new(address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 1,
@@ -442,7 +484,9 @@ mod tests {
         let content = b"test content";
         let wrong_address = [0xFF; 32]; // Wrong address
 
-        // No payment proof needed (EVM disabled in test)
+        // Pre-populate cache for the wrong address so we test address mismatch, not payment
+        protocol.payment_verifier().cache_insert(wrong_address);
+
         let put_request = ChunkPutRequest::new(wrong_address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 20,
@@ -506,7 +550,9 @@ mod tests {
         let content = b"duplicate content";
         let address = LmdbStorage::compute_address(content);
 
-        // Store first time - no payment proof needed (EVM disabled in test)
+        // Pre-populate cache so EVM verification is bypassed
+        protocol.payment_verifier().cache_insert(address);
+
         let put_request = ChunkPutRequest::new(address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 40,
@@ -563,17 +609,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_populates_payment_cache() {
+    async fn test_cache_insert_is_visible() {
         let (protocol, _temp) = create_test_protocol().await;
 
         let content = b"cache test content";
         let address = LmdbStorage::compute_address(content);
 
-        // Before PUT: cache should be empty
+        // Before insert: cache should be empty
         let stats_before = protocol.payment_cache_stats();
         assert_eq!(stats_before.additions, 0);
 
-        // PUT (EVM disabled — verifier will auto-accept and cache)
+        // Pre-populate cache
+        protocol.payment_verifier().cache_insert(address);
+
+        // After insert: cache should have the xorname
+        let stats_after = protocol.payment_cache_stats();
+        assert_eq!(stats_after.additions, 1);
+
+        // PUT should succeed (cache hit)
         let put_request = ChunkPutRequest::new(address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 100,
@@ -591,10 +644,6 @@ mod tests {
         } else {
             panic!("expected success, got: {response:?}");
         }
-
-        // After PUT: cache should have the xorname
-        let stats_after = protocol.payment_cache_stats();
-        assert_eq!(stats_after.additions, 1);
     }
 
     #[tokio::test]
@@ -603,6 +652,9 @@ mod tests {
 
         let content = b"duplicate cache test";
         let address = LmdbStorage::compute_address(content);
+
+        // Pre-populate cache for first PUT
+        protocol.payment_verifier().cache_insert(address);
 
         // First PUT
         let put_request = ChunkPutRequest::new(address, content.to_vec());
@@ -640,9 +692,11 @@ mod tests {
         assert_eq!(stats.misses, 0);
         assert_eq!(stats.additions, 0);
 
-        // Store a chunk to trigger payment verification
+        // Pre-populate cache, then store a chunk to test stats
         let content = b"stats test";
         let address = LmdbStorage::compute_address(content);
+        protocol.payment_verifier().cache_insert(address);
+
         let put_request = ChunkPutRequest::new(address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 120,
@@ -655,9 +709,9 @@ mod tests {
             .expect("handle put");
 
         let stats = protocol.payment_cache_stats();
-        // Should have 1 miss (first lookup) + 1 addition (after verify)
-        assert_eq!(stats.misses, 1);
+        // Should have 1 addition (from cache_insert) + 1 hit (payment verification found cache)
         assert_eq!(stats.additions, 1);
+        assert_eq!(stats.hits, 1);
     }
 
     #[tokio::test]
@@ -691,6 +745,86 @@ mod tests {
             assert!(msg.contains("Unexpected"));
         } else {
             panic!("expected Internal error, got: {response:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quote_already_stored_flag() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let content = b"already stored quote test";
+        let address = LmdbStorage::compute_address(content);
+
+        // Store the chunk first
+        protocol.payment_verifier().cache_insert(address);
+        let put_request = ChunkPutRequest::new(address, content.to_vec());
+        let put_msg = ChunkMessage {
+            request_id: 300,
+            body: ChunkMessageBody::PutRequest(put_request),
+        };
+        let put_bytes = put_msg.encode().expect("encode put");
+        let _ = protocol
+            .handle_message(&put_bytes)
+            .await
+            .expect("handle put");
+
+        // Now request a quote for the same address — already_stored should be true
+        let quote_request = ChunkQuoteRequest {
+            address,
+            data_size: content.len() as u64,
+            data_type: DATA_TYPE_CHUNK,
+        };
+        let quote_msg = ChunkMessage {
+            request_id: 301,
+            body: ChunkMessageBody::QuoteRequest(quote_request),
+        };
+        let quote_bytes = quote_msg.encode().expect("encode quote");
+        let response_bytes = protocol
+            .handle_message(&quote_bytes)
+            .await
+            .expect("handle quote");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode");
+
+        match response.body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                already_stored, ..
+            }) => {
+                assert!(
+                    already_stored,
+                    "already_stored should be true for existing chunk"
+                );
+            }
+            other => panic!("expected Success with already_stored, got: {other:?}"),
+        }
+
+        // Request a quote for a chunk that does NOT exist — already_stored should be false
+        let new_address = [0xFFu8; 32];
+        let quote_request2 = ChunkQuoteRequest {
+            address: new_address,
+            data_size: 100,
+            data_type: DATA_TYPE_CHUNK,
+        };
+        let quote_msg2 = ChunkMessage {
+            request_id: 302,
+            body: ChunkMessageBody::QuoteRequest(quote_request2),
+        };
+        let quote_bytes2 = quote_msg2.encode().expect("encode quote2");
+        let response_bytes2 = protocol
+            .handle_message(&quote_bytes2)
+            .await
+            .expect("handle quote2");
+        let response2 = ChunkMessage::decode(&response_bytes2).expect("decode2");
+
+        match response2.body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                already_stored, ..
+            }) => {
+                assert!(
+                    !already_stored,
+                    "already_stored should be false for new chunk"
+                );
+            }
+            other => panic!("expected Success with already_stored=false, got: {other:?}"),
         }
     }
 }
