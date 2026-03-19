@@ -126,8 +126,11 @@ impl PaymentVerifier {
     /// Create a new payment verifier.
     #[must_use]
     pub fn new(config: PaymentVerifierConfig) -> Self {
+        const _: () = assert!(
+            DEFAULT_POOL_CACHE_CAPACITY > 0,
+            "pool cache capacity must be > 0"
+        );
         let cache = VerifiedCache::with_capacity(config.cache_capacity);
-        // SAFETY: DEFAULT_POOL_CACHE_CAPACITY is a const > 0, so this is always Some
         let pool_cache_size =
             NonZeroUsize::new(DEFAULT_POOL_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
         let pool_cache = Mutex::new(LruCache::new(pool_cache_size));
@@ -556,14 +559,16 @@ impl PaymentVerifier {
                         ))
                     })?;
 
+            let paid_node_addresses: Vec<_> = info
+                .paidNodeAddresses
+                .iter()
+                .map(|pna| (pna.rewardsAddress, usize::from(pna.poolIndex)))
+                .collect();
+
             let on_chain_info = OnChainPaymentInfo {
                 depth: info.depth,
                 merkle_payment_timestamp: info.merklePaymentTimestamp,
-                paid_node_addresses: info
-                    .paidNodeAddresses
-                    .iter()
-                    .map(|pna| (pna.rewardsAddress, pna.poolIndex as usize))
-                    .collect(),
+                paid_node_addresses,
             };
 
             // Cache the pool info for subsequent chunks in the same batch
@@ -1435,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_cache_same_hash_queries_once() {
+    fn test_pool_cache_insert_and_lookup() {
         use evmlib::merkle_batch_payment::PoolHash;
 
         // Verify the pool_cache field exists and works correctly.

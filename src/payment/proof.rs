@@ -125,6 +125,9 @@ mod tests {
     use evmlib::quoting_metrics::QuotingMetrics;
     use libp2p::identity::Keypair;
     use libp2p::PeerId;
+    use saorsa_core::MlDsa65;
+    use saorsa_pqc::pqc::types::MlDsaSecretKey;
+    use saorsa_pqc::pqc::MlDsaOperations;
     use std::time::SystemTime;
     use xor_name::XorName;
 
@@ -306,28 +309,36 @@ mod tests {
             .collect();
         let tree = MerkleTree::from_xornames(addresses.clone()).unwrap();
 
-        // Build candidate nodes
+        // Build candidate nodes with ML-DSA-65 signing (matching production)
         let candidate_nodes: [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] =
             std::array::from_fn(|i| {
-                let kp = Keypair::generate_ed25519();
-                MerklePaymentCandidateNode::new(
-                    &kp,
-                    QuotingMetrics {
-                        data_size: 1024,
-                        data_type: 0,
-                        close_records_stored: i * 10,
-                        records_per_type: vec![],
-                        max_records: 500,
-                        received_payment_count: 0,
-                        live_time: 100,
-                        network_density: None,
-                        network_size: None,
-                    },
-                    #[allow(clippy::cast_possible_truncation)]
-                    RewardsAddress::new([i as u8; 20]),
-                    timestamp,
-                )
-                .expect("candidate node creation should succeed")
+                let ml_dsa = MlDsa65::new();
+                let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
+                let metrics = QuotingMetrics {
+                    data_size: 1024,
+                    data_type: 0,
+                    close_records_stored: i * 10,
+                    records_per_type: vec![],
+                    max_records: 500,
+                    received_payment_count: 0,
+                    live_time: 100,
+                    network_density: None,
+                    network_size: None,
+                };
+                #[allow(clippy::cast_possible_truncation)]
+                let reward_address = RewardsAddress::new([i as u8; 20]);
+                let msg =
+                    MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
+                let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
+                let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
+
+                MerklePaymentCandidateNode {
+                    pub_key: pub_key.as_bytes().to_vec(),
+                    quoting_metrics: metrics,
+                    reward_address,
+                    merkle_payment_timestamp: timestamp,
+                    signature,
+                }
             });
 
         let reward_candidates = tree.reward_candidates(timestamp).unwrap();
