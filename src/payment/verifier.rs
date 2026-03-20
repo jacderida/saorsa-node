@@ -593,13 +593,20 @@ impl PaymentVerifier {
         // hash. The ML-DSA signature check below ensures the pool contents are
         // authentic (nodes actually signed their candidate quotes).
 
-        // Verify ML-DSA-65 signatures on all candidate nodes in the winner pool.
-        // Without this, a client could fabricate a pool with fake reward addresses
-        // since the contract only commits to the bytes the client submitted.
+        // Verify ML-DSA-65 signatures and timestamp/data_type consistency
+        // on all candidate nodes in the winner pool.
         for candidate in &merkle_proof.winner_pool.candidate_nodes {
             if !crate::payment::verify_merkle_candidate_signature(candidate) {
                 return Err(Error::Payment(format!(
                     "Invalid ML-DSA-65 signature on merkle candidate node (reward: {})",
+                    candidate.reward_address
+                )));
+            }
+            if candidate.merkle_payment_timestamp != payment_info.merkle_payment_timestamp {
+                return Err(Error::Payment(format!(
+                    "Candidate timestamp mismatch: expected {}, got {} (reward: {})",
+                    payment_info.merkle_payment_timestamp,
+                    candidate.merkle_payment_timestamp,
                     candidate.reward_address
                 )));
             }
