@@ -81,15 +81,64 @@ impl AntProtocol {
         CHUNK_PROTOCOL_ID
     }
 
+    /// Handle an incoming request and produce a response.
+    ///
+    /// Decodes the raw message, processes it if it is a request variant,
+    /// and returns the encoded response bytes.  Returns `Ok(None)` for
+    /// response messages (which are meant for client subscribers, not for
+    /// the protocol handler).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if message decoding, handling, or encoding fails.
+    pub async fn try_handle_request(&self, data: &[u8]) -> Result<Option<Bytes>> {
+        let message = ChunkMessage::decode(data)
+            .map_err(|e| Error::Protocol(format!("Failed to decode message: {e}")))?;
+
+        let request_id = message.request_id;
+
+        let response_body = match message.body {
+            ChunkMessageBody::PutRequest(req) => {
+                ChunkMessageBody::PutResponse(self.handle_put(req).await)
+            }
+            ChunkMessageBody::GetRequest(req) => {
+                ChunkMessageBody::GetResponse(self.handle_get(req).await)
+            }
+            ChunkMessageBody::QuoteRequest(ref req) => {
+                ChunkMessageBody::QuoteResponse(self.handle_quote(req))
+            }
+            ChunkMessageBody::MerkleCandidateQuoteRequest(ref req) => {
+                ChunkMessageBody::MerkleCandidateQuoteResponse(
+                    self.handle_merkle_candidate_quote(req),
+                )
+            }
+            // Response messages are handled by client subscribers
+            // (e.g. send_and_await_chunk_response), not by the protocol
+            // handler. Returning None prevents the caller from sending a
+            // reply, which would create an infinite ping-pong loop.
+            ChunkMessageBody::PutResponse(_)
+            | ChunkMessageBody::GetResponse(_)
+            | ChunkMessageBody::QuoteResponse(_)
+            | ChunkMessageBody::MerkleCandidateQuoteResponse(_) => return Ok(None),
+        };
+
+        let response = ChunkMessage {
+            request_id,
+            body: response_body,
+        };
+
+        response
+            .encode()
+            .map(|b| Some(Bytes::from(b)))
+            .map_err(|e| Error::Protocol(format!("Failed to encode response: {e}")))
+    }
+
     /// Handle an incoming protocol message.
     ///
-    /// # Arguments
-    ///
-    /// * `data` - Raw message bytes
-    ///
-    /// # Returns
-    ///
-    /// Response bytes, or an error if handling fails.
+    /// **Deprecated**: Use [`try_handle_request`](Self::try_handle_request)
+    /// instead. This method always returns response bytes — even for
+    /// response messages that should be ignored — which can create an
+    /// infinite ping-pong loop if the caller blindly sends the result back.
     ///
     /// # Errors
     ///
@@ -115,7 +164,6 @@ impl AntProtocol {
                     self.handle_merkle_candidate_quote(req),
                 )
             }
-            // Response messages shouldn't be received as requests
             ChunkMessageBody::PutResponse(_)
             | ChunkMessageBody::GetResponse(_)
             | ChunkMessageBody::QuoteResponse(_)
