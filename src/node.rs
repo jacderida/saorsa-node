@@ -730,11 +730,11 @@ impl RunningNode {
                                 return;
                             };
                             let result = match data_type {
-                                "chunk" => protocol.handle_message(&data).await,
+                                "chunk" => protocol.try_handle_request(&data).await,
                                 _ => return,
                             };
                             match result {
-                                Ok(response) => {
+                                Ok(Some(response)) => {
                                     if let Err(e) = p2p
                                         .send_message(
                                             &source,
@@ -747,6 +747,7 @@ impl RunningNode {
                                         warn!("Failed to send {data_type} protocol response to {source}: {e}");
                                     }
                                 }
+                                Ok(None) => {}
                                 Err(e) => {
                                     warn!("{data_type} protocol handler error: {e}");
                                 }

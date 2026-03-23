@@ -662,8 +662,8 @@ impl Devnet {
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
                             tokio::spawn(async move {
-                                match protocol.handle_message(&data).await {
-                                    Ok(response) => {
+                                match protocol.try_handle_request(&data).await {
+                                    Ok(Some(response)) => {
                                         if let Err(e) = p2p
                                             .send_message(
                                                 &source,
@@ -678,6 +678,7 @@ impl Devnet {
                                             );
                                         }
                                     }
+                                    Ok(None) => {}
                                     Err(e) => {
                                         warn!("Node {node_index} protocol handler error: {e}");
                                     }
