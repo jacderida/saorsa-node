@@ -496,7 +496,12 @@ impl TestNode {
                     ))
                 })?
                 .map_err(|e| TestnetError::Storage(format!("Protocol error: {e}")))?
-                .ok_or_else(|| TestnetError::Storage("expected response".to_string()))?;
+                .ok_or_else(|| {
+                    TestnetError::Storage(format!(
+                        "Protocol returned no response for PUT request (request_id={request_id}, node_index={})",
+                        self.index
+                    ))
+                })?;
 
         // Parse response
         let response = ChunkMessage::decode(&response_bytes)
@@ -564,7 +569,11 @@ impl TestNode {
                     ))
                 })?
                 .map_err(|e| TestnetError::Retrieval(format!("Protocol error: {e}")))?
-                .ok_or_else(|| TestnetError::Retrieval("expected response".to_string()))?;
+                .ok_or_else(|| {
+                    TestnetError::Retrieval(format!(
+                        "Protocol returned no response for GET request (request_id={request_id}, address={address:?})"
+                    ))
+                })?;
 
         // Parse response
         let response = ChunkMessage::decode(&response_bytes)

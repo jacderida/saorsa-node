@@ -22,7 +22,8 @@
 //! │         │                         │                 │  │
 //! │         └─────────────────────────┴─────────────────┘  │
 //! │                           │                             │
-//! │                 return Ok(response_bytes)               │
+//! │           return Ok(Some(response_bytes))              │
+//! │           return Ok(None) for response messages       │
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
