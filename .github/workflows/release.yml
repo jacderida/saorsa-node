@@ -390,7 +390,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [validate, sign]
+    needs: [validate, sign, publish-crate]
     runs-on: ubuntu-latest
     if: github.event.inputs.dry_run != 'true'
     steps:
