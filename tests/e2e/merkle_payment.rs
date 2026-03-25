@@ -24,7 +24,9 @@ use ant_node::ant_protocol::{
     PROOF_TAG_MERKLE,
 };
 use ant_node::compute_address;
-use ant_node::payment::serialize_merkle_proof;
+use ant_node::payment::{
+    serialize_merkle_proof, MAX_PAYMENT_PROOF_SIZE_BYTES, MIN_PAYMENT_PROOF_SIZE_BYTES,
+};
 use evmlib::quoting_metrics::QuotingMetrics;
 use evmlib::testnet::Testnet;
 use rand::Rng;
@@ -40,13 +42,15 @@ use tracing::info;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Check if a `ChunkMessageBody` indicates payment rejection.
-fn is_payment_rejection(body: &ChunkMessageBody) -> bool {
+/// Check if a `ChunkMessageBody` indicates a rejection (payment or address error).
+fn is_rejection(body: &ChunkMessageBody) -> bool {
     matches!(
         body,
         ChunkMessageBody::PutResponse(
             ChunkPutResponse::PaymentRequired { .. }
-                | ChunkPutResponse::Error(ProtocolError::PaymentFailed(_))
+                | ChunkPutResponse::Error(
+                    ProtocolError::PaymentFailed(_) | ProtocolError::AddressMismatch { .. }
+                )
         )
     )
 }
@@ -74,9 +78,10 @@ async fn send_put_to_node(
         .encode()
         .map_err(|e| format!("Encode failed: {e}"))?;
     let response_bytes = protocol
-        .handle_message(&message_bytes)
+        .try_handle_request(&message_bytes)
         .await
-        .map_err(|e| format!("Handle failed: {e}"))?;
+        .map_err(|e| format!("Handle failed: {e}"))?
+        .ok_or("No response returned (unexpected None)")?;
     ChunkMessage::decode(&response_bytes).map_err(|e| format!("Decode failed: {e}"))
 }
 
@@ -92,125 +97,50 @@ async fn setup_enforcement_env() -> Result<(TestHarness, Testnet), Box<dyn std::
     Ok((harness, testnet))
 }
 
-/// Build a valid `MerklePaymentProof` with real ML-DSA-65 signatures.
-///
-/// Returns `(target_xorname, tagged_proof_bytes, addresses_in_tree)`.
-fn build_valid_merkle_proof() -> (xor_name::XorName, Vec<u8>, Vec<xor_name::XorName>) {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time")
-        .as_secs();
-
-    let addresses: Vec<xor_name::XorName> = (0..4u8)
-        .map(|i| xor_name::XorName::from_content(&[i]))
-        .collect();
-    let tree = MerkleTree::from_xornames(addresses.clone()).expect("tree");
-
-    let candidate_nodes: [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] =
-        std::array::from_fn(|i| {
-            let ml_dsa = MlDsa65::new();
-            let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-            let metrics = QuotingMetrics {
-                data_size: 1024,
-                data_type: 0,
-                close_records_stored: i * 10,
-                records_per_type: vec![],
-                max_records: 500,
-                received_payment_count: 0,
-                live_time: 100,
-                network_density: None,
-                network_size: None,
-            };
-            #[allow(clippy::cast_possible_truncation)]
-            let reward_address = RewardsAddress::new([i as u8; 20]);
-            let msg =
-                MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
-            let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
-            let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
-
-            MerklePaymentCandidateNode {
-                pub_key: pub_key.as_bytes().to_vec(),
-                quoting_metrics: metrics,
-                reward_address,
-                merkle_payment_timestamp: timestamp,
-                signature,
-            }
-        });
-
-    let reward_candidates = tree
-        .reward_candidates(timestamp)
-        .expect("reward candidates");
-    let midpoint_proof = reward_candidates
-        .first()
-        .expect("at least one candidate")
-        .clone();
-
-    let pool = MerklePaymentCandidatePool {
-        midpoint_proof,
-        candidate_nodes,
-    };
-
-    let first_address = *addresses.first().expect("first address");
-    let address_proof = tree
-        .generate_address_proof(0, first_address)
-        .expect("proof");
-
-    let merkle_proof = MerklePaymentProof::new(first_address, address_proof, pool);
-    let tagged = serialize_merkle_proof(&merkle_proof).expect("serialize merkle proof");
-
-    (first_address, tagged, addresses)
+/// Data for a single entry in the merkle tree: the content bytes and the
+/// BLAKE3-derived xorname used as the chunk address.
+struct TreeEntry {
+    content: Vec<u8>,
+    address: xor_name::XorName,
 }
 
-/// Build a merkle proof with one tampered candidate signature.
-fn build_tampered_signature_merkle_proof() -> (xor_name::XorName, Vec<u8>) {
+/// Result of building a valid merkle proof.
+struct ValidMerkleProof {
+    /// The tree entry the proof is bound to (first address).
+    target: TreeEntry,
+    /// The serialized & tagged proof bytes.
+    tagged_proof: Vec<u8>,
+    /// All entries in the tree (including `target`).
+    entries: Vec<TreeEntry>,
+}
+
+/// Build a valid `MerklePaymentProof` with real ML-DSA-65 signatures.
+///
+/// Addresses are derived via BLAKE3 (`compute_address`) so that they match
+/// the protocol handler's address verification step.
+fn build_valid_merkle_proof() -> ValidMerkleProof {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time")
         .as_secs();
 
-    let addresses: Vec<xor_name::XorName> = (0..4u8)
-        .map(|i| xor_name::XorName::from_content(&[i]))
-        .collect();
-    let tree = MerkleTree::from_xornames(addresses.clone()).expect("tree");
-
-    let mut candidate_nodes: [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] =
-        std::array::from_fn(|i| {
-            let ml_dsa = MlDsa65::new();
-            let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-            let metrics = QuotingMetrics {
-                data_size: 1024,
-                data_type: 0,
-                close_records_stored: i * 10,
-                records_per_type: vec![],
-                max_records: 500,
-                received_payment_count: 0,
-                live_time: 100,
-                network_density: None,
-                network_size: None,
-            };
-            #[allow(clippy::cast_possible_truncation)]
-            let reward_address = RewardsAddress::new([i as u8; 20]);
-            let msg =
-                MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
-            let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
-            let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
-
-            MerklePaymentCandidateNode {
-                pub_key: pub_key.as_bytes().to_vec(),
-                quoting_metrics: metrics,
-                reward_address,
-                merkle_payment_timestamp: timestamp,
-                signature,
+    // Build content blobs and derive BLAKE3 addresses for the merkle tree.
+    let entries: Vec<TreeEntry> = (0..4u8)
+        .map(|i| {
+            let content = vec![i; 64];
+            let blake3_hash = compute_address(&content);
+            TreeEntry {
+                content,
+                address: xor_name::XorName(blake3_hash),
             }
-        });
+        })
+        .collect();
 
-    // Tamper the first candidate's signature
-    if let Some(byte) = candidate_nodes
-        .first_mut()
-        .and_then(|c| c.signature.first_mut())
-    {
-        *byte ^= 0xFF;
-    }
+    let addresses: Vec<xor_name::XorName> = entries.iter().map(|e| e.address).collect();
+    let tree = MerkleTree::from_xornames(addresses).expect("tree");
+
+    let candidate_nodes: [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] =
+        build_candidate_nodes(timestamp);
 
     let reward_candidates = tree
         .reward_candidates(timestamp)
@@ -225,7 +155,7 @@ fn build_tampered_signature_merkle_proof() -> (xor_name::XorName, Vec<u8>) {
         candidate_nodes,
     };
 
-    let first_address = *addresses.first().expect("first address");
+    let first_address = entries.first().expect("first entry").address;
     let address_proof = tree
         .generate_address_proof(0, first_address)
         .expect("proof");
@@ -233,7 +163,46 @@ fn build_tampered_signature_merkle_proof() -> (xor_name::XorName, Vec<u8>) {
     let merkle_proof = MerklePaymentProof::new(first_address, address_proof, pool);
     let tagged = serialize_merkle_proof(&merkle_proof).expect("serialize merkle proof");
 
-    (first_address, tagged)
+    ValidMerkleProof {
+        target: TreeEntry {
+            content: entries.first().expect("first entry").content.clone(),
+            address: first_address,
+        },
+        tagged_proof: tagged,
+        entries,
+    }
+}
+
+/// Build 16 validly-signed ML-DSA-65 candidate nodes for a merkle proof.
+fn build_candidate_nodes(timestamp: u64) -> [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] {
+    std::array::from_fn(|i| {
+        let ml_dsa = MlDsa65::new();
+        let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
+        let metrics = QuotingMetrics {
+            data_size: 1024,
+            data_type: 0,
+            close_records_stored: i * 10,
+            records_per_type: vec![],
+            max_records: 500,
+            received_payment_count: 0,
+            live_time: 100,
+            network_density: None,
+            network_size: None,
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let reward_address = RewardsAddress::new([i as u8; 20]);
+        let msg = MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
+        let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
+        let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
+
+        MerklePaymentCandidateNode {
+            pub_key: pub_key.as_bytes().to_vec(),
+            quoting_metrics: metrics,
+            reward_address,
+            merkle_payment_timestamp: timestamp,
+            signature,
+        }
+    })
 }
 
 // ===========================================================================
@@ -255,8 +224,8 @@ async fn test_attack_merkle_tagged_garbage() -> Result<(), Box<dyn std::error::E
     // Build garbage with correct merkle tag but invalid body
     let mut garbage = vec![PROOF_TAG_MERKLE];
     garbage.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-    // Pad to minimum proof size (32 bytes)
-    while garbage.len() < 32 {
+    // Pad to minimum proof size
+    while garbage.len() < MIN_PAYMENT_PROOF_SIZE_BYTES {
         garbage.push(0x00);
     }
 
@@ -267,7 +236,7 @@ async fn test_attack_merkle_tagged_garbage() -> Result<(), Box<dyn std::error::E
         .map_err(|e| format!("Send failed: {e}"))?;
 
     assert!(
-        is_payment_rejection(&response.body),
+        is_rejection(&response.body),
         "Merkle-tagged garbage MUST be rejected, got: {response:?}"
     );
     info!("Correctly rejected: merkle-tagged garbage");
@@ -290,20 +259,21 @@ async fn test_attack_merkle_proof_wrong_xorname() -> Result<(), Box<dyn std::err
     let (harness, _testnet) = setup_enforcement_env().await?;
 
     // Build a valid merkle proof for one xorname
-    let (_proof_xorname, tagged_proof, _addrs) = build_valid_merkle_proof();
+    let proof = build_valid_merkle_proof();
 
     // Try to use it for a completely different chunk
     let wrong_data = b"This chunk was never paid for via this merkle proof";
     let wrong_address = compute_address(wrong_data);
 
-    let request = ChunkPutRequest::with_payment(wrong_address, wrong_data.to_vec(), tagged_proof);
+    let request =
+        ChunkPutRequest::with_payment(wrong_address, wrong_data.to_vec(), proof.tagged_proof);
 
     let response = send_put_to_node(&harness, 0, request)
         .await
         .map_err(|e| format!("Send failed: {e}"))?;
 
     assert!(
-        is_payment_rejection(&response.body),
+        is_rejection(&response.body),
         "Merkle proof for wrong xorname MUST be rejected, got: {response:?}"
     );
     info!("Correctly rejected: merkle proof for wrong xorname");
@@ -326,18 +296,31 @@ async fn test_attack_merkle_tampered_candidate_signature() -> Result<(), Box<dyn
 
     let (harness, _testnet) = setup_enforcement_env().await?;
 
-    let (proof_xorname, tagged_proof) = build_tampered_signature_merkle_proof();
+    // Build a valid proof then tamper the first candidate's signature
+    let proof = build_valid_merkle_proof();
+    let mut tampered_proof =
+        ant_node::payment::deserialize_merkle_proof(&proof.tagged_proof).expect("deserialize");
+    if let Some(byte) = tampered_proof
+        .winner_pool
+        .candidate_nodes
+        .first_mut()
+        .and_then(|c| c.signature.first_mut())
+    {
+        *byte ^= 0xFF;
+    }
+    let tagged_proof = serialize_merkle_proof(&tampered_proof).expect("re-serialize");
 
-    // Use the correct xorname but the proof has a tampered signature
-    let test_data = proof_xorname.0.to_vec();
-    let request = ChunkPutRequest::with_payment(proof_xorname.0, test_data, tagged_proof);
+    // Build request with correct content whose BLAKE3 hash matches the proof address
+    let content = proof.target.content;
+    let address = proof.target.address.0;
+    let request = ChunkPutRequest::with_payment(address, content, tagged_proof);
 
     let response = send_put_to_node(&harness, 0, request)
         .await
         .map_err(|e| format!("Send failed: {e}"))?;
 
     assert!(
-        is_payment_rejection(&response.body),
+        is_rejection(&response.body),
         "Merkle proof with tampered signature MUST be rejected, got: {response:?}"
     );
     info!("Correctly rejected: tampered candidate signature");
@@ -352,58 +335,40 @@ async fn test_attack_merkle_tampered_candidate_signature() -> Result<(), Box<dyn
 
 /// Verify that a full merkle proof with 16 ML-DSA-65 candidates
 /// serializes within the allowed size limits.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_merkle_proof_serialized_size_e2e() -> Result<(), Box<dyn std::error::Error>> {
-    info!("MERKLE TEST: proof serialization size validation");
-
-    let (_xorname, tagged_proof, _addrs) = build_valid_merkle_proof();
+#[test]
+fn test_merkle_proof_serialized_size_e2e() {
+    let proof = build_valid_merkle_proof();
 
     // 16 candidates with ~1952-byte pub keys and ~3309-byte signatures ≈ ~130 KB
-    // Must be within [32, 262144] bytes
     assert!(
-        tagged_proof.len() >= 32,
-        "Merkle proof ({} bytes) must be >= 32 bytes",
-        tagged_proof.len()
+        proof.tagged_proof.len() >= MIN_PAYMENT_PROOF_SIZE_BYTES,
+        "Merkle proof ({} bytes) must be >= {MIN_PAYMENT_PROOF_SIZE_BYTES} bytes",
+        proof.tagged_proof.len()
     );
     assert!(
-        tagged_proof.len() <= 262_144,
-        "Merkle proof ({} bytes) must be <= 256 KB",
-        tagged_proof.len()
+        proof.tagged_proof.len() <= MAX_PAYMENT_PROOF_SIZE_BYTES,
+        "Merkle proof ({} bytes) must be <= {MAX_PAYMENT_PROOF_SIZE_BYTES} bytes",
+        proof.tagged_proof.len()
     );
-
-    let size_kb = tagged_proof.len() / 1024;
-    info!(
-        "Merkle proof size: {} bytes (~{size_kb} KB) — within limits",
-        tagged_proof.len(),
-    );
-
-    Ok(())
 }
 
 /// Verify merkle proof tag detection works correctly end-to-end.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn test_merkle_proof_tag_detection_e2e() -> Result<(), Box<dyn std::error::Error>> {
-    info!("MERKLE TEST: proof tag detection");
-
-    let (_xorname, tagged_proof, _addrs) = build_valid_merkle_proof();
+#[test]
+fn test_merkle_proof_tag_detection_e2e() {
+    let proof = build_valid_merkle_proof();
 
     assert_eq!(
-        tagged_proof.first().copied(),
+        proof.tagged_proof.first().copied(),
         Some(PROOF_TAG_MERKLE),
         "First byte must be PROOF_TAG_MERKLE (0x02)"
     );
 
-    let detected = ant_node::payment::detect_proof_type(&tagged_proof);
+    let detected = ant_node::payment::detect_proof_type(&proof.tagged_proof);
     assert_eq!(
         detected,
         Some(ant_node::payment::ProofType::Merkle),
         "detect_proof_type must identify as Merkle"
     );
-
-    info!("Merkle proof tag detection confirmed");
-    Ok(())
 }
 
 // ===========================================================================
@@ -425,7 +390,7 @@ async fn test_attack_merkle_garbage_all_nodes_concurrent() -> Result<(), Box<dyn
 
     let mut garbage = vec![PROOF_TAG_MERKLE];
     garbage.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
-    while garbage.len() < 32 {
+    while garbage.len() < MIN_PAYMENT_PROOF_SIZE_BYTES {
         garbage.push(0x00);
     }
 
@@ -447,9 +412,10 @@ async fn test_attack_merkle_garbage_all_nodes_concurrent() -> Result<(), Box<dyn
                 let proto = protocol.clone();
                 handles.push(tokio::spawn(async move {
                     let resp_bytes = proto
-                        .handle_message(&msg_bytes)
+                        .try_handle_request(&msg_bytes)
                         .await
-                        .map_err(|e| format!("Node {i}: {e}"))?;
+                        .map_err(|e| format!("Node {i}: {e}"))?
+                        .ok_or_else(|| format!("Node {i}: unexpected None response"))?;
                     let resp = ChunkMessage::decode(&resp_bytes)
                         .map_err(|e| format!("Node {i} decode: {e}"))?;
                     Ok::<(usize, ChunkMessage), String>((i, resp))
@@ -462,7 +428,7 @@ async fn test_attack_merkle_garbage_all_nodes_concurrent() -> Result<(), Box<dyn
     for handle in handles {
         let (node_idx, response) = handle.await.expect("task panicked")?;
         assert!(
-            is_payment_rejection(&response.body),
+            is_rejection(&response.body),
             "Node {node_idx} MUST reject merkle garbage, got: {response:?}"
         );
         rejection_count += 1;
@@ -493,21 +459,23 @@ async fn test_attack_merkle_proof_cross_address_replay() -> Result<(), Box<dyn s
 
     let (harness, _testnet) = setup_enforcement_env().await?;
 
-    // Build proof bound to addresses[0]
-    let (_first_address, tagged_proof, addresses) = build_valid_merkle_proof();
+    // Build proof bound to entries[0]
+    let proof = build_valid_merkle_proof();
 
-    // Try to use it for addresses[1] (different address in the same tree)
-    let second_address = addresses.get(1).expect("should have 4 addresses");
+    // Try to use it for entries[1] (different address in the same tree)
+    let second = proof.entries.get(1).expect("should have 4 entries");
 
+    // Build request with second entry's correct content/address pair,
+    // but using the proof that was bound to entries[0].
     let request =
-        ChunkPutRequest::with_payment(second_address.0, second_address.0.to_vec(), tagged_proof);
+        ChunkPutRequest::with_payment(second.address.0, second.content.clone(), proof.tagged_proof);
 
     let response = send_put_to_node(&harness, 0, request)
         .await
         .map_err(|e| format!("Send failed: {e}"))?;
 
     assert!(
-        is_payment_rejection(&response.body),
+        is_rejection(&response.body),
         "Cross-address replay MUST be rejected, got: {response:?}"
     );
     info!("Correctly rejected: cross-address replay within same tree");

@@ -26,7 +26,7 @@ use tracing::{debug, info};
 ///
 /// This minimum ensures the proof contains at least a basic cryptographic hash or identifier.
 /// Proofs smaller than this are rejected as they cannot contain sufficient payment information.
-const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
+pub const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
 
 /// Maximum allowed size for a payment proof in bytes (256 KB).
 ///
@@ -34,7 +34,7 @@ const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
 /// Merkle proofs include 16 candidate nodes (each with ~1,952-byte ML-DSA pub key
 /// and ~3,309-byte signature) plus merkle branch hashes, totaling ~130 KB.
 /// 256 KB provides headroom while still capping memory during verification.
-const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 262_144;
+pub const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 262_144;
 
 /// Maximum age of a payment quote before it's considered expired (24 hours).
 /// Prevents replaying old cheap quotes against nearly-full nodes.
@@ -1495,64 +1495,70 @@ mod tests {
     // Merkle verification unit tests
     // =========================================================================
 
-    /// Helper: build a minimal valid `MerklePaymentProof` with real ML-DSA-65
-    /// signatures. Returns `(xorname, serialized_tagged_proof, pool_hash, timestamp)`.
-    fn make_valid_merkle_proof_bytes() -> (
-        [u8; 32],
-        Vec<u8>,
-        evmlib::merkle_batch_payment::PoolHash,
-        u64,
-    ) {
-        use ant_evm::merkle_payments::{
-            MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
-            CANDIDATES_PER_POOL,
-        };
+    /// Helper: build 16 validly-signed ML-DSA-65 candidate nodes.
+    fn make_candidate_nodes(
+        timestamp: u64,
+    ) -> [ant_evm::merkle_payments::MerklePaymentCandidateNode;
+           ant_evm::merkle_payments::CANDIDATES_PER_POOL] {
+        use ant_evm::merkle_payments::{MerklePaymentCandidateNode, CANDIDATES_PER_POOL};
         use saorsa_core::MlDsa65;
         use saorsa_pqc::pqc::types::MlDsaSecretKey;
         use saorsa_pqc::pqc::MlDsaOperations;
+
+        std::array::from_fn::<_, CANDIDATES_PER_POOL, _>(|i| {
+            let ml_dsa = MlDsa65::new();
+            let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
+            let metrics = ant_evm::QuotingMetrics {
+                data_size: 1024,
+                data_type: 0,
+                close_records_stored: i * 10,
+                records_per_type: vec![],
+                max_records: 500,
+                received_payment_count: 0,
+                live_time: 100,
+                network_density: None,
+                network_size: None,
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let reward_address = RewardsAddress::new([i as u8; 20]);
+            let msg =
+                MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
+            let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
+            let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
+
+            MerklePaymentCandidateNode {
+                pub_key: pub_key.as_bytes().to_vec(),
+                quoting_metrics: metrics,
+                reward_address,
+                merkle_payment_timestamp: timestamp,
+                signature,
+            }
+        })
+    }
+
+    /// Helper: build a valid `MerklePaymentProof` with real ML-DSA-65
+    /// signatures. Returns the raw proof, pool hash, xorname, and timestamp.
+    fn make_valid_merkle_proof() -> (
+        ant_evm::merkle_payments::MerklePaymentProof,
+        evmlib::merkle_batch_payment::PoolHash,
+        [u8; 32],
+        u64,
+    ) {
+        use ant_evm::merkle_payments::{
+            MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
+        };
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_secs();
 
-        // Build a tree with 4 addresses
         let addresses: Vec<xor_name::XorName> = (0..4u8)
             .map(|i| xor_name::XorName::from_content(&[i]))
             .collect();
         let tree = MerkleTree::from_xornames(addresses.clone()).expect("tree");
 
-        // Build candidate pool with real ML-DSA-65 signatures
-        let candidate_nodes: [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] =
-            std::array::from_fn(|i| {
-                let ml_dsa = MlDsa65::new();
-                let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-                let metrics = ant_evm::QuotingMetrics {
-                    data_size: 1024,
-                    data_type: 0,
-                    close_records_stored: i * 10,
-                    records_per_type: vec![],
-                    max_records: 500,
-                    received_payment_count: 0,
-                    live_time: 100,
-                    network_density: None,
-                    network_size: None,
-                };
-                #[allow(clippy::cast_possible_truncation)]
-                let reward_address = RewardsAddress::new([i as u8; 20]);
-                let msg =
-                    MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
-                let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
-                let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
-
-                MerklePaymentCandidateNode {
-                    pub_key: pub_key.as_bytes().to_vec(),
-                    quoting_metrics: metrics,
-                    reward_address,
-                    merkle_payment_timestamp: timestamp,
-                    signature,
-                }
-            });
+        let candidate_nodes = make_candidate_nodes(timestamp);
 
         let reward_candidates = tree
             .reward_candidates(timestamp)
@@ -1576,9 +1582,20 @@ mod tests {
         let pool_hash = merkle_proof.winner_pool_hash();
         let xorname = first_address.0;
 
+        (merkle_proof, pool_hash, xorname, timestamp)
+    }
+
+    /// Helper: build a minimal valid `MerklePaymentProof` with real ML-DSA-65
+    /// signatures. Returns `(xorname, serialized_tagged_proof, pool_hash, timestamp)`.
+    fn make_valid_merkle_proof_bytes() -> (
+        [u8; 32],
+        Vec<u8>,
+        evmlib::merkle_batch_payment::PoolHash,
+        u64,
+    ) {
+        let (merkle_proof, pool_hash, xorname, timestamp) = make_valid_merkle_proof();
         let tagged = crate::payment::proof::serialize_merkle_proof(&merkle_proof)
             .expect("serialize merkle proof");
-
         (xorname, tagged, pool_hash, timestamp)
     }
 
@@ -1756,94 +1773,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_tampered_candidate_signature_rejected() {
-        use ant_evm::merkle_payments::{
-            MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
-            CANDIDATES_PER_POOL,
-        };
-        use saorsa_core::MlDsa65;
-        use saorsa_pqc::pqc::types::MlDsaSecretKey;
-        use saorsa_pqc::pqc::MlDsaOperations;
-
         let verifier = create_test_verifier();
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_secs();
-
-        let addresses: Vec<xor_name::XorName> = (0..4u8)
-            .map(|i| xor_name::XorName::from_content(&[i]))
-            .collect();
-        let tree = MerkleTree::from_xornames(addresses.clone()).expect("tree");
-
-        let mut candidate_nodes: [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] =
-            std::array::from_fn(|i| {
-                let ml_dsa = MlDsa65::new();
-                let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-                let metrics = ant_evm::QuotingMetrics {
-                    data_size: 1024,
-                    data_type: 0,
-                    close_records_stored: i * 10,
-                    records_per_type: vec![],
-                    max_records: 500,
-                    received_payment_count: 0,
-                    live_time: 100,
-                    network_density: None,
-                    network_size: None,
-                };
-                #[allow(clippy::cast_possible_truncation)]
-                let reward_address = RewardsAddress::new([i as u8; 20]);
-                let msg =
-                    MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
-                let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
-                let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
-
-                MerklePaymentCandidateNode {
-                    pub_key: pub_key.as_bytes().to_vec(),
-                    quoting_metrics: metrics,
-                    reward_address,
-                    merkle_payment_timestamp: timestamp,
-                    signature,
-                }
-            });
+        let (mut merkle_proof, _pool_hash, xorname, timestamp) = make_valid_merkle_proof();
 
         // Tamper the first candidate's signature
-        if let Some(byte) = candidate_nodes
+        if let Some(byte) = merkle_proof
+            .winner_pool
+            .candidate_nodes
             .first_mut()
             .and_then(|c| c.signature.first_mut())
         {
             *byte ^= 0xFF;
         }
 
-        let reward_candidates = tree
-            .reward_candidates(timestamp)
-            .expect("reward candidates");
-        let midpoint_proof = reward_candidates
-            .first()
-            .expect("at least one candidate")
-            .clone();
-
-        let pool = MerklePaymentCandidatePool {
-            midpoint_proof,
-            candidate_nodes,
-        };
-
-        let first_address = *addresses.first().expect("first address");
-        let address_proof = tree
-            .generate_address_proof(0, first_address)
-            .expect("proof");
-        let merkle_proof = MerklePaymentProof::new(first_address, address_proof, pool);
-        let xorname = first_address.0;
+        // Recompute pool hash after tampering (signature change alters the hash)
+        let tampered_pool_hash = merkle_proof.winner_pool_hash();
 
         // Pre-populate pool cache so we skip the on-chain query
-        let pool_hash = merkle_proof.winner_pool_hash();
         {
             let info = ant_evm::merkle_payments::OnChainPaymentInfo {
                 depth: 4,
                 merkle_payment_timestamp: timestamp,
                 paid_node_addresses: vec![],
             };
-            verifier.pool_cache.lock().put(pool_hash, info);
+            verifier.pool_cache.lock().put(tampered_pool_hash, info);
         }
 
         let tagged =
@@ -1864,80 +1818,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_timestamp_mismatch_rejected() {
-        use ant_evm::merkle_payments::{
-            MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
-            CANDIDATES_PER_POOL,
-        };
-        use saorsa_core::MlDsa65;
-        use saorsa_pqc::pqc::types::MlDsaSecretKey;
-        use saorsa_pqc::pqc::MlDsaOperations;
-
         let verifier = create_test_verifier();
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_secs();
-
-        let addresses: Vec<xor_name::XorName> = (0..4u8)
-            .map(|i| xor_name::XorName::from_content(&[i]))
-            .collect();
-        let tree = MerkleTree::from_xornames(addresses.clone()).expect("tree");
-
-        // All candidates signed with the correct timestamp
-        let candidate_nodes: [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] =
-            std::array::from_fn(|i| {
-                let ml_dsa = MlDsa65::new();
-                let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-                let metrics = ant_evm::QuotingMetrics {
-                    data_size: 1024,
-                    data_type: 0,
-                    close_records_stored: i * 10,
-                    records_per_type: vec![],
-                    max_records: 500,
-                    received_payment_count: 0,
-                    live_time: 100,
-                    network_density: None,
-                    network_size: None,
-                };
-                #[allow(clippy::cast_possible_truncation)]
-                let reward_address = RewardsAddress::new([i as u8; 20]);
-                let msg =
-                    MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
-                let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
-                let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
-
-                MerklePaymentCandidateNode {
-                    pub_key: pub_key.as_bytes().to_vec(),
-                    quoting_metrics: metrics,
-                    reward_address,
-                    merkle_payment_timestamp: timestamp,
-                    signature,
-                }
-            });
-
-        let reward_candidates = tree
-            .reward_candidates(timestamp)
-            .expect("reward candidates");
-        let midpoint_proof = reward_candidates
-            .first()
-            .expect("at least one candidate")
-            .clone();
-
-        let pool = MerklePaymentCandidatePool {
-            midpoint_proof,
-            candidate_nodes,
-        };
-
-        let first_address = *addresses.first().expect("first address");
-        let address_proof = tree
-            .generate_address_proof(0, first_address)
-            .expect("proof");
-        let merkle_proof = MerklePaymentProof::new(first_address, address_proof, pool);
-        let xorname = first_address.0;
+        let (xorname, tagged, pool_hash, timestamp) = make_valid_merkle_proof_bytes();
 
         // Pre-populate pool cache with a DIFFERENT timestamp than the candidates
-        let pool_hash = merkle_proof.winner_pool_hash();
         {
             let mismatched_ts = timestamp + 9999;
             let info = ant_evm::merkle_payments::OnChainPaymentInfo {
@@ -1947,9 +1832,6 @@ mod tests {
             };
             verifier.pool_cache.lock().put(pool_hash, info);
         }
-
-        let tagged =
-            crate::payment::proof::serialize_merkle_proof(&merkle_proof).expect("serialize");
 
         let result = verifier.verify_payment(&xorname, Some(&tagged)).await;
 
