@@ -35,19 +35,19 @@ fn zero_quoting_metrics() -> QuotingMetrics {
     }
 }
 
-/// Index of the median-priced node after sorting
-const MEDIAN_INDEX: usize = 2;
+/// Index of the median-priced node after sorting, derived from `CLOSE_GROUP_SIZE`.
+const MEDIAN_INDEX: usize = CLOSE_GROUP_SIZE / 2;
 
 /// Single node payment structure for a chunk.
 ///
-/// Contains exactly 5 quotes where only the median-priced one receives payment (3x),
-/// and the other 4 have `Amount::ZERO`.
+/// Contains exactly `CLOSE_GROUP_SIZE` quotes where only the median-priced one
+/// receives payment (3x), and the remaining quotes have `Amount::ZERO`.
 ///
-/// The fixed-size array ensures compile-time enforcement of the 5-quote requirement,
-/// making the median index (2) always valid.
+/// The fixed-size array ensures compile-time enforcement of the quote count,
+/// making the median index always valid.
 #[derive(Debug, Clone)]
 pub struct SingleNodePayment {
-    /// All 5 quotes (sorted by price) - fixed size ensures median index is always valid
+    /// All quotes (sorted by price) - fixed size ensures median index is always valid
     pub quotes: [QuotePaymentInfo; CLOSE_GROUP_SIZE],
 }
 
@@ -336,9 +336,9 @@ mod tests {
 
         let transaction_config = TransactionConfig::default();
 
-        // Create 5 random quote payments (autonomi pattern)
+        // Create CLOSE_GROUP_SIZE random quote payments (autonomi pattern)
         let mut quote_payments = vec![];
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let quote_hash = dummy_hash();
             let reward_address = dummy_address();
             let amount = Amount::from(1u64);
@@ -410,8 +410,8 @@ mod tests {
 
         let mut quote_payments = vec![(real_quote_hash, real_reward_address, real_amount)];
 
-        // Add 4 dummy payments with 0 amount
-        for _ in 0..4 {
+        // Add dummy payments with 0 amount for remaining close group members
+        for _ in 0..CLOSE_GROUP_SIZE - 1 {
             let dummy_quote_hash = dummy_hash();
             let dummy_reward_address = dummy_address();
             let dummy_amount = Amount::from(0u64); // 0 amount
@@ -557,8 +557,9 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn test_paid_quote_returns_median() {
-        let quotes: Vec<_> = (0..5u8)
-            .map(|i| (make_test_quote(i + 1), Amount::from(u64::from(i + 1) * 10)))
+        let quotes: Vec<_> = (1u8..)
+            .take(CLOSE_GROUP_SIZE)
+            .map(|i| (make_test_quote(i), Amount::from(u64::from(i) * 10)))
             .collect();
 
         let payment = SingleNodePayment::from_quotes(quotes).unwrap();
@@ -574,17 +575,18 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn test_all_quotes_have_distinct_addresses() {
-        let quotes: Vec<_> = (0..5u8)
-            .map(|i| (make_test_quote(i + 1), Amount::from(u64::from(i + 1) * 10)))
+        let quotes: Vec<_> = (1u8..)
+            .take(CLOSE_GROUP_SIZE)
+            .map(|i| (make_test_quote(i), Amount::from(u64::from(i) * 10)))
             .collect();
 
         let payment = SingleNodePayment::from_quotes(quotes).unwrap();
 
-        // Verify all 5 quotes are present (sorting doesn't lose data)
+        // Verify all quotes are present (sorting doesn't lose data)
         let mut addresses: Vec<_> = payment.quotes.iter().map(|q| q.rewards_address).collect();
         addresses.sort();
         addresses.dedup();
-        assert_eq!(addresses.len(), 5);
+        assert_eq!(addresses.len(), CLOSE_GROUP_SIZE);
     }
 
     #[test]
