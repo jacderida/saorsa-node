@@ -585,16 +585,33 @@ impl RunningNode {
                                     warn!("Error during upgrade process: {}", e);
                                 }
                             }
-                            // Schedule next check with jitter to prevent fleet re-alignment
-                            let jittered_duration =
-                                jittered_interval(monitor.check_interval());
-                            let next_check = chrono::Utc::now()
-                                + chrono::Duration::from_std(jittered_duration).unwrap_or_else(|e| {
-                                    warn!("chrono::Duration::from_std failed for interval ({e}), defaulting to 1 hour");
-                                    chrono::Duration::hours(1)
-                                });
-                            info!("Next upgrade check scheduled for {}", next_check.to_rfc3339());
-                            tokio::time::sleep(jittered_duration).await;
+                            // If an upgrade is pending, sleep for exactly the remaining
+                            // rollout delay so the node restarts at its scheduled time
+                            // rather than waiting for the next check interval tick.
+                            let sleep_duration = monitor.time_until_upgrade().map_or_else(
+                                || {
+                                    // No pending upgrade - schedule next check with jitter
+                                    let jittered_duration =
+                                        jittered_interval(monitor.check_interval());
+                                    let next_check = chrono::Utc::now()
+                                        + chrono::Duration::from_std(jittered_duration).unwrap_or_else(|e| {
+                                            warn!("chrono::Duration::from_std failed for interval ({e}), defaulting to 1 hour");
+                                            chrono::Duration::hours(1)
+                                        });
+                                    info!("Next upgrade check scheduled for {}", next_check.to_rfc3339());
+                                    jittered_duration
+                                },
+                                |remaining| {
+                                    let wake_time = chrono::Utc::now()
+                                        + chrono::Duration::from_std(remaining).unwrap_or_else(|e| {
+                                            warn!("chrono::Duration::from_std failed for rollout delay ({e}), defaulting to 1 minute");
+                                            chrono::Duration::minutes(1)
+                                        });
+                                    info!("Will apply upgrade at {}", wake_time.to_rfc3339());
+                                    remaining
+                                },
+                            );
+                            tokio::time::sleep(sleep_duration).await;
                         }
                     }
                 }
