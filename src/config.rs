@@ -10,19 +10,6 @@ pub const NODE_IDENTITY_FILENAME: &str = "node_identity.key";
 /// Subdirectory under the root dir that contains per-node data directories.
 pub const NODES_SUBDIR: &str = "nodes";
 
-/// IP version configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum IpVersion {
-    /// IPv4 only.
-    Ipv4,
-    /// IPv6 only.
-    Ipv6,
-    /// Dual-stack (both IPv4 and IPv6).
-    #[default]
-    Dual,
-}
-
 /// Upgrade channel for auto-updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -99,9 +86,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub port: u16,
 
-    /// IP version to use.
+    /// Force IPv4-only mode.
+    ///
+    /// When true, the node binds only on IPv4 instead of dual-stack.
+    /// Use this on hosts without working IPv6 to avoid advertising
+    /// unreachable addresses to the DHT.
     #[serde(default)]
-    pub ip_version: IpVersion,
+    pub ipv4_only: bool,
 
     /// Bootstrap peer addresses.
     #[serde(default)]
@@ -249,7 +240,7 @@ impl Default for NodeConfig {
         Self {
             root_dir: default_root_dir(),
             port: 0,
-            ip_version: IpVersion::default(),
+            ipv4_only: false,
             bootstrap: Vec::new(),
             network_mode: NetworkMode::default(),
             testnet: TestnetConfig::default(),

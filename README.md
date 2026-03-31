@@ -907,7 +907,6 @@ You can also specify bootstrap peers explicitly:
 ./target/release/ant-node \
     --root-dir ~/.ant-node \
     --port 12000 \
-    --ip-version dual \
     --upgrade-channel stable \
     --migrate-ant-data auto \
     --log-level info
@@ -929,9 +928,9 @@ Options:
         Listening port (0 for automatic selection)
         [default: 0]
 
-    --ip-version <VERSION>
-        IP version to use: ipv4, ipv6, or dual
-        [default: dual]
+    --ipv4-only
+        Force IPv4-only mode (disable dual-stack).
+        Use on hosts without working IPv6.
 
     --bootstrap <ADDR>
         Bootstrap peer socket addresses (can be specified multiple times)
@@ -1003,7 +1002,6 @@ peers = [
 ```bash
 export ANT_ROOT_DIR=~/.ant-node
 export ANT_PORT=12000
-export ANT_IP_VERSION=dual
 export ANT_LOG_LEVEL=info
 export ANT_AUTO_UPGRADE=true
 export ANT_UPGRADE_CHANNEL=stable
@@ -1016,7 +1014,6 @@ export ANT_UPGRADE_CHANNEL=stable
 ```toml
 root_dir = "~/.ant-node"
 port = 0  # Auto-select
-ip_version = "dual"
 bootstrap = [
     "10.0.0.1:10000",
     "10.0.0.2:10000",

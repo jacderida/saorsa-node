@@ -2,7 +2,7 @@
 
 use crate::ant_protocol::{CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE};
 use crate::config::{
-    default_nodes_dir, default_root_dir, EvmNetworkConfig, IpVersion, NetworkMode, NodeConfig,
+    default_nodes_dir, default_root_dir, EvmNetworkConfig, NetworkMode, NodeConfig,
     NODE_IDENTITY_FILENAME,
 };
 use crate::error::{Error, Result};
@@ -151,12 +151,11 @@ impl NodeBuilder {
 
     /// Build the saorsa-core `NodeConfig` from our config.
     fn build_core_config(config: &NodeConfig) -> Result<CoreNodeConfig> {
-        let ipv6 = matches!(config.ip_version, IpVersion::Ipv6 | IpVersion::Dual);
         let local = matches!(config.network_mode, NetworkMode::Development);
 
         let mut core_config = CoreNodeConfig::builder()
             .port(config.port)
-            .ipv6(ipv6)
+            .ipv6(!config.ipv4_only)
             .local(local)
             .max_message_size(config.max_message_size)
             .build()
@@ -860,6 +859,23 @@ mod tests {
         };
         let core = NodeBuilder::build_core_config(&config).expect("core config");
         assert!(core.diversity_config.is_some());
+    }
+
+    #[test]
+    fn test_build_core_config_ipv4_only() {
+        let config = NodeConfig {
+            ipv4_only: true,
+            ..Default::default()
+        };
+        let core = NodeBuilder::build_core_config(&config).expect("core config");
+        assert!(!core.ipv6, "ipv4_only should disable IPv6");
+    }
+
+    #[test]
+    fn test_build_core_config_dual_stack_by_default() {
+        let config = NodeConfig::default();
+        let core = NodeBuilder::build_core_config(&config).expect("core config");
+        assert!(core.ipv6, "dual-stack should be the default");
     }
 
     #[test]
