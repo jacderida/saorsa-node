@@ -2285,6 +2285,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.4.9"
+source = "git+https://github.com/WithAutonomi/evmlib.git?branch=feat/merge-ant-evm#976696e2f0f858ed9bd804f573f0799a170ffa3b"
 dependencies = [
  "alloy",
  "ant-merkle",

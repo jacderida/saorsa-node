@@ -28,7 +28,8 @@ saorsa-core = "0.20.0"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
-evmlib = { path = "/Users/anselme/Documents/maidsafe/saorsa/evmlib" }
+# TODO: update to crates.io version once evmlib with merged ant-evm types is released
+evmlib = { git = "https://github.com/WithAutonomi/evmlib.git", branch = "feat/merge-ant-evm" }
 xor_name = "5"
 
 # Caching - LRU cache for verified XorNames
