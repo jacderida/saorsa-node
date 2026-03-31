@@ -1,0 +1,932 @@
+//! Quorum verification logic (Section 9).
+//!
+//! Single-round batched verification: presence + paid-list evidence collected
+//! in one request round to `VerifyTargets = PaidTargets ∪ QuorumTargets`.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use saorsa_core::identity::PeerId;
+use saorsa_core::P2PNode;
+use tracing::{debug, warn};
+
+use crate::ant_protocol::XorName;
+use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
+use crate::replication::protocol::{
+    ReplicationMessage, ReplicationMessageBody, VerificationRequest, VerificationResponse,
+};
+use crate::replication::types::{KeyVerificationEvidence, PaidListEvidence, PresenceEvidence};
+
+// ---------------------------------------------------------------------------
+// Verification targets
+// ---------------------------------------------------------------------------
+
+/// Targets for verifying a set of keys.
+#[derive(Debug)]
+pub struct VerificationTargets {
+    /// Per-key: closest `CLOSE_GROUP_SIZE` peers (excluding self) for presence
+    /// quorum.
+    pub quorum_targets: HashMap<XorName, Vec<PeerId>>,
+    /// Per-key: `PaidCloseGroup` peers for paid-list majority.
+    pub paid_targets: HashMap<XorName, Vec<PeerId>>,
+    /// Union of all target peers across all keys.
+    pub all_peers: HashSet<PeerId>,
+    /// Which keys each peer should be queried about.
+    pub peer_to_keys: HashMap<PeerId, Vec<XorName>>,
+    /// Which keys need paid-list checks from which peers.
+    pub peer_to_paid_keys: HashMap<PeerId, HashSet<XorName>>,
+}
+
+/// Compute verification targets for a batch of keys.
+///
+/// For each key, determines the `QuorumTargets` (closest `CLOSE_GROUP_SIZE`
+/// peers excluding self) and `PaidTargets` (`PaidCloseGroup` excluding self),
+/// then unions them into per-peer request batches.
+pub async fn compute_verification_targets(
+    keys: &[XorName],
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+    self_id: &PeerId,
+) -> VerificationTargets {
+    let dht = p2p_node.dht_manager();
+    let mut targets = VerificationTargets {
+        quorum_targets: HashMap::new(),
+        paid_targets: HashMap::new(),
+        all_peers: HashSet::new(),
+        peer_to_keys: HashMap::new(),
+        peer_to_paid_keys: HashMap::new(),
+    };
+
+    for &key in keys {
+        // QuorumTargets: up to CLOSE_GROUP_SIZE nearest peers for K, excluding
+        // self.
+        let closest = dht
+            .find_closest_nodes_local(&key, config.close_group_size)
+            .await;
+        let quorum_peers: Vec<PeerId> = closest
+            .iter()
+            .filter(|n| n.peer_id != *self_id)
+            .map(|n| n.peer_id)
+            .collect();
+
+        // PaidTargets: PaidCloseGroup(K) excluding self.
+        let paid_closest = dht
+            .find_closest_nodes_local_with_self(&key, config.paid_list_close_group_size)
+            .await;
+        let paid_peers: Vec<PeerId> = paid_closest
+            .iter()
+            .filter(|n| n.peer_id != *self_id)
+            .map(|n| n.peer_id)
+            .collect();
+
+        // VerifyTargets = PaidTargets ∪ QuorumTargets
+        for &peer in &quorum_peers {
+            targets.all_peers.insert(peer);
+            targets.peer_to_keys.entry(peer).or_default().push(key);
+        }
+        for &peer in &paid_peers {
+            targets.all_peers.insert(peer);
+            targets.peer_to_keys.entry(peer).or_default().push(key);
+            targets
+                .peer_to_paid_keys
+                .entry(peer)
+                .or_default()
+                .insert(key);
+        }
+
+        targets.quorum_targets.insert(key, quorum_peers);
+        targets.paid_targets.insert(key, paid_peers);
+    }
+
+    // Deduplicate keys per peer (a peer in both quorum and paid targets for
+    // the same key would have it listed twice).
+    for keys_list in targets.peer_to_keys.values_mut() {
+        keys_list.sort_unstable();
+        keys_list.dedup();
+    }
+
+    targets
+}
+
+// ---------------------------------------------------------------------------
+// Verification outcome
+// ---------------------------------------------------------------------------
+
+/// Outcome of verifying a single key.
+#[derive(Debug, Clone)]
+pub enum KeyVerificationOutcome {
+    /// Presence quorum passed.
+    QuorumVerified {
+        /// Peers that responded `Present` (verified fetch sources).
+        sources: Vec<PeerId>,
+    },
+    /// Paid-list authorization succeeded.
+    PaidListVerified {
+        /// Peers that responded `Present` (potential fetch sources, may be
+        /// empty).
+        sources: Vec<PeerId>,
+    },
+    /// Quorum failed definitively (both paths impossible).
+    QuorumFailed,
+    /// Inconclusive (timeout with neither success nor fail-fast).
+    QuorumInconclusive,
+}
+
+// ---------------------------------------------------------------------------
+// Evidence evaluation (pure logic, no I/O)
+// ---------------------------------------------------------------------------
+
+/// Evaluate verification evidence for a single key.
+///
+/// Returns the outcome based on Section 9 rules:
+/// - **Step 10**: If presence positives >= `QuorumNeeded(K)`, `QuorumVerified`.
+/// - **Step 9**: If paid confirmations >= `ConfirmNeeded(K)`,
+///   `PaidListVerified`.
+/// - **Step 14**: Fail fast when both paths are impossible.
+/// - **Step 15**: Otherwise inconclusive.
+#[must_use]
+pub fn evaluate_key_evidence(
+    key: &XorName,
+    evidence: &KeyVerificationEvidence,
+    targets: &VerificationTargets,
+    config: &ReplicationConfig,
+) -> KeyVerificationOutcome {
+    let quorum_peers = targets
+        .quorum_targets
+        .get(key)
+        .map_or(&[][..], Vec::as_slice);
+
+    // Count presence evidence from QuorumTargets.
+    let mut presence_positive = 0usize;
+    let mut presence_unresolved = 0usize;
+    let mut present_peers = Vec::new();
+
+    for peer in quorum_peers {
+        match evidence.presence.get(peer) {
+            Some(PresenceEvidence::Present) => {
+                presence_positive += 1;
+                present_peers.push(*peer);
+            }
+            Some(PresenceEvidence::Absent) => {}
+            Some(PresenceEvidence::Unresolved) | None => {
+                presence_unresolved += 1;
+            }
+        }
+    }
+
+    // Also collect Present peers from paid targets for fetch sources.
+    let paid_peers = targets.paid_targets.get(key).map_or(&[][..], Vec::as_slice);
+
+    for peer in paid_peers {
+        if matches!(evidence.presence.get(peer), Some(PresenceEvidence::Present))
+            && !present_peers.contains(peer)
+        {
+            present_peers.push(*peer);
+        }
+    }
+
+    // Count paid-list evidence from PaidTargets.
+    let mut paid_confirmed = 0usize;
+    let mut paid_unresolved = 0usize;
+
+    for peer in paid_peers {
+        match evidence.paid_list.get(peer) {
+            Some(PaidListEvidence::Confirmed) => paid_confirmed += 1,
+            Some(PaidListEvidence::NotFound) => {}
+            Some(PaidListEvidence::Unresolved) | None => paid_unresolved += 1,
+        }
+    }
+
+    let quorum_needed = config.quorum_needed(quorum_peers.len());
+    let paid_group_size = paid_peers.len();
+    let confirm_needed = ReplicationConfig::confirm_needed(paid_group_size);
+
+    // Step 10: Presence quorum reached.
+    if presence_positive >= quorum_needed {
+        return KeyVerificationOutcome::QuorumVerified {
+            sources: present_peers,
+        };
+    }
+
+    // Step 9: Paid-list majority reached.
+    if paid_confirmed >= confirm_needed {
+        return KeyVerificationOutcome::PaidListVerified {
+            sources: present_peers,
+        };
+    }
+
+    // Step 14: Fail fast when both paths are impossible.
+    let paid_possible = paid_confirmed + paid_unresolved >= confirm_needed;
+    let quorum_possible = presence_positive + presence_unresolved >= quorum_needed;
+
+    if !paid_possible && !quorum_possible {
+        return KeyVerificationOutcome::QuorumFailed;
+    }
+
+    // Step 15: Neither success nor fail-fast.
+    KeyVerificationOutcome::QuorumInconclusive
+}
+
+// ---------------------------------------------------------------------------
+// Network verification round
+// ---------------------------------------------------------------------------
+
+/// Send batched verification requests to all peers and collect evidence.
+///
+/// Implements Section 9 requirement: one request per peer carrying many keys.
+/// Returns per-key evidence aggregated from all peer responses.
+pub async fn run_verification_round(
+    keys: &[XorName],
+    targets: &VerificationTargets,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+) -> HashMap<XorName, KeyVerificationEvidence> {
+    // Initialize empty evidence for all keys.
+    let mut evidence: HashMap<XorName, KeyVerificationEvidence> = keys
+        .iter()
+        .map(|&k| {
+            (
+                k,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            )
+        })
+        .collect();
+
+    // Send one batched request per peer.
+    let mut handles = Vec::new();
+
+    for (&peer, peer_keys) in &targets.peer_to_keys {
+        let paid_check_keys = targets.peer_to_paid_keys.get(&peer);
+
+        // Build paid_list_check_indices: which of this peer's keys need
+        // paid-list status.
+        let mut paid_indices = Vec::new();
+        for (i, key) in peer_keys.iter().enumerate() {
+            if let Some(paid_keys) = paid_check_keys {
+                if paid_keys.contains(key) {
+                    if let Ok(idx) = u16::try_from(i) {
+                        paid_indices.push(idx);
+                    }
+                }
+            }
+        }
+
+        let request = VerificationRequest {
+            keys: peer_keys.clone(),
+            paid_list_check_indices: paid_indices,
+        };
+
+        let msg = ReplicationMessage {
+            request_id: rand::random(),
+            body: ReplicationMessageBody::VerificationRequest(request),
+        };
+
+        let p2p = Arc::clone(p2p_node);
+        let timeout = config.verification_request_timeout;
+        let peer_id = peer;
+
+        handles.push(tokio::spawn(async move {
+            let encoded = match msg.encode() {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!("Failed to encode verification request: {e}");
+                    return (peer_id, None);
+                }
+            };
+
+            match p2p
+                .send_request(&peer_id, REPLICATION_PROTOCOL_ID, encoded, timeout)
+                .await
+            {
+                Ok(response) => match ReplicationMessage::decode(&response.data) {
+                    Ok(decoded) => (peer_id, Some(decoded)),
+                    Err(e) => {
+                        warn!("Failed to decode verification response from {peer_id}: {e}");
+                        (peer_id, None)
+                    }
+                },
+                Err(e) => {
+                    debug!("Verification request to {peer_id} failed: {e}");
+                    (peer_id, None)
+                }
+            }
+        }));
+    }
+
+    // Collect responses.
+    for handle in handles {
+        let (peer, response) = match handle.await {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Verification task panicked: {e}");
+                continue;
+            }
+        };
+
+        let Some(msg) = response else {
+            // Timeout/error: mark all keys for this peer as unresolved.
+            mark_peer_unresolved(&peer, targets, &mut evidence);
+            continue;
+        };
+
+        if let ReplicationMessageBody::VerificationResponse(resp) = msg.body {
+            process_verification_response(&peer, &resp, targets, &mut evidence);
+        }
+    }
+
+    evidence
+}
+
+/// Mark all keys for a peer as unresolved (timeout / decode failure).
+fn mark_peer_unresolved(
+    peer: &PeerId,
+    targets: &VerificationTargets,
+    evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+) {
+    if let Some(peer_keys) = targets.peer_to_keys.get(peer) {
+        let is_paid_peer = targets.peer_to_paid_keys.get(peer);
+        for key in peer_keys {
+            if let Some(ev) = evidence.get_mut(key) {
+                ev.presence.insert(*peer, PresenceEvidence::Unresolved);
+                if is_paid_peer.is_some_and(|ks| ks.contains(key)) {
+                    ev.paid_list.insert(*peer, PaidListEvidence::Unresolved);
+                }
+            }
+        }
+    }
+}
+
+/// Process a single peer's verification response into the evidence map.
+fn process_verification_response(
+    peer: &PeerId,
+    response: &VerificationResponse,
+    targets: &VerificationTargets,
+    evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+) {
+    let Some(peer_keys) = targets.peer_to_keys.get(peer) else {
+        return;
+    };
+
+    // Match response results to requested keys.
+    for result in &response.results {
+        if !peer_keys.contains(&result.key) {
+            continue; // Ignore unsolicited key results.
+        }
+
+        if let Some(ev) = evidence.get_mut(&result.key) {
+            // Presence evidence.
+            let presence = if result.present {
+                PresenceEvidence::Present
+            } else {
+                PresenceEvidence::Absent
+            };
+            ev.presence.insert(*peer, presence);
+
+            // Paid-list evidence (only if requested).
+            if let Some(is_paid) = result.paid {
+                let paid = if is_paid {
+                    PaidListEvidence::Confirmed
+                } else {
+                    PaidListEvidence::NotFound
+                };
+                ev.paid_list.insert(*peer, paid);
+            }
+        }
+    }
+
+    // Keys that were requested but not in response -> unresolved.
+    let is_paid_peer = targets.peer_to_paid_keys.get(peer);
+    for key in peer_keys {
+        if let Some(ev) = evidence.get_mut(key) {
+            ev.presence
+                .entry(*peer)
+                .or_insert(PresenceEvidence::Unresolved);
+            if is_paid_peer.is_some_and(|ks| ks.contains(key)) {
+                ev.paid_list
+                    .entry(*peer)
+                    .or_insert(PaidListEvidence::Unresolved);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::replication::protocol::KeyVerificationResult;
+
+    /// Build a `PeerId` from a single byte (zero-padded to 32 bytes).
+    fn peer_id_from_byte(b: u8) -> PeerId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = b;
+        PeerId::from_bytes(bytes)
+    }
+
+    /// Build an `XorName` from a single byte (repeated to 32 bytes).
+    fn xor_name_from_byte(b: u8) -> XorName {
+        [b; 32]
+    }
+
+    /// Helper: build minimal `VerificationTargets` for a single key with
+    /// explicit quorum and paid peer lists.
+    fn single_key_targets(
+        key: &XorName,
+        quorum_peers: Vec<PeerId>,
+        paid_peers: Vec<PeerId>,
+    ) -> VerificationTargets {
+        let mut all_peers = HashSet::new();
+        let mut peer_to_keys: HashMap<PeerId, Vec<XorName>> = HashMap::new();
+        let mut peer_to_paid_keys: HashMap<PeerId, HashSet<XorName>> = HashMap::new();
+
+        for &p in &quorum_peers {
+            all_peers.insert(p);
+            peer_to_keys.entry(p).or_default().push(*key);
+        }
+        for &p in &paid_peers {
+            all_peers.insert(p);
+            peer_to_keys.entry(p).or_default().push(*key);
+            peer_to_paid_keys.entry(p).or_default().insert(*key);
+        }
+
+        // Deduplicate keys per peer.
+        for keys_list in peer_to_keys.values_mut() {
+            keys_list.sort();
+            keys_list.dedup();
+        }
+
+        VerificationTargets {
+            quorum_targets: [(key.to_owned(), quorum_peers)].into_iter().collect(),
+            paid_targets: [(key.to_owned(), paid_peers)].into_iter().collect(),
+            all_peers,
+            peer_to_keys,
+            peer_to_paid_keys,
+        }
+    }
+
+    /// Helper: build `KeyVerificationEvidence` from presence and paid-list
+    /// maps.
+    fn build_evidence(
+        presence: Vec<(PeerId, PresenceEvidence)>,
+        paid_list: Vec<(PeerId, PaidListEvidence)>,
+    ) -> KeyVerificationEvidence {
+        KeyVerificationEvidence {
+            presence: presence.into_iter().collect(),
+            paid_list: paid_list.into_iter().collect(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // evaluate_key_evidence: QuorumVerified
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quorum_verified_with_enough_present_responses() {
+        let key = xor_name_from_byte(0x10);
+        let config = ReplicationConfig::default();
+
+        // 7 quorum peers, threshold = min(4, floor(7/2)+1) = 4
+        let quorum_peers: Vec<PeerId> = (1..=7).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), vec![]);
+
+        // 4 peers say Present, 3 say Absent.
+        let evidence = build_evidence(
+            vec![
+                (quorum_peers[0], PresenceEvidence::Present),
+                (quorum_peers[1], PresenceEvidence::Present),
+                (quorum_peers[2], PresenceEvidence::Present),
+                (quorum_peers[3], PresenceEvidence::Present),
+                (quorum_peers[4], PresenceEvidence::Absent),
+                (quorum_peers[5], PresenceEvidence::Absent),
+                (quorum_peers[6], PresenceEvidence::Absent),
+            ],
+            vec![],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumVerified { ref sources } if sources.len() == 4),
+            "expected QuorumVerified with 4 sources, got {outcome:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // evaluate_key_evidence: PaidListVerified
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn paid_list_verified_with_enough_confirmations() {
+        let key = xor_name_from_byte(0x20);
+        let config = ReplicationConfig::default();
+
+        // 5 paid peers, confirm_needed = floor(5/2)+1 = 3
+        let paid_peers: Vec<PeerId> = (10..=14).map(peer_id_from_byte).collect();
+        // No quorum peers (or quorum fails).
+        let quorum_peers: Vec<PeerId> = (1..=3).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        // Quorum: all Absent (fails presence path).
+        // Paid: 3 Confirmed, 2 NotFound -> majority reached.
+        let evidence = build_evidence(
+            vec![
+                (quorum_peers[0], PresenceEvidence::Absent),
+                (quorum_peers[1], PresenceEvidence::Absent),
+                (quorum_peers[2], PresenceEvidence::Absent),
+            ],
+            vec![
+                (paid_peers[0], PaidListEvidence::Confirmed),
+                (paid_peers[1], PaidListEvidence::Confirmed),
+                (paid_peers[2], PaidListEvidence::Confirmed),
+                (paid_peers[3], PaidListEvidence::NotFound),
+                (paid_peers[4], PaidListEvidence::NotFound),
+            ],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "expected PaidListVerified, got {outcome:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // evaluate_key_evidence: QuorumFailed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quorum_failed_when_both_paths_impossible() {
+        let key = xor_name_from_byte(0x30);
+        let config = ReplicationConfig::default();
+
+        // 5 quorum peers, quorum_needed = min(4, floor(5/2)+1) = min(4,3) = 3
+        let quorum_peers: Vec<PeerId> = (1..=5).map(peer_id_from_byte).collect();
+        // 3 paid peers, confirm_needed = floor(3/2)+1 = 2
+        let paid_peers: Vec<PeerId> = (10..=12).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        // Presence: all 5 Absent (0 positive, 0 unresolved) -> can't reach 3.
+        // Paid: all 3 NotFound (0 confirmed, 0 unresolved) -> can't reach 2.
+        let evidence = build_evidence(
+            vec![
+                (quorum_peers[0], PresenceEvidence::Absent),
+                (quorum_peers[1], PresenceEvidence::Absent),
+                (quorum_peers[2], PresenceEvidence::Absent),
+                (quorum_peers[3], PresenceEvidence::Absent),
+                (quorum_peers[4], PresenceEvidence::Absent),
+            ],
+            vec![
+                (paid_peers[0], PaidListEvidence::NotFound),
+                (paid_peers[1], PaidListEvidence::NotFound),
+                (paid_peers[2], PaidListEvidence::NotFound),
+            ],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumFailed),
+            "expected QuorumFailed, got {outcome:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // evaluate_key_evidence: QuorumInconclusive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quorum_inconclusive_with_unresolved_peers() {
+        let key = xor_name_from_byte(0x40);
+        let config = ReplicationConfig::default();
+
+        // 5 quorum peers, quorum_needed = min(4, 3) = 3
+        let quorum_peers: Vec<PeerId> = (1..=5).map(peer_id_from_byte).collect();
+        // 3 paid peers, confirm_needed = 2
+        let paid_peers: Vec<PeerId> = (10..=12).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        // Presence: 2 Present, 1 Absent, 2 Unresolved.
+        // positive=2, unresolved=2 -> 2+2=4 >= 3 -> quorum still possible.
+        // Paid: 1 Confirmed, 1 Unresolved, 1 NotFound.
+        // confirmed=1, unresolved=1 -> 1+1=2 >= 2 -> paid still possible.
+        // Neither path reached yet -> Inconclusive.
+        let evidence = build_evidence(
+            vec![
+                (quorum_peers[0], PresenceEvidence::Present),
+                (quorum_peers[1], PresenceEvidence::Present),
+                (quorum_peers[2], PresenceEvidence::Absent),
+                (quorum_peers[3], PresenceEvidence::Unresolved),
+                (quorum_peers[4], PresenceEvidence::Unresolved),
+            ],
+            vec![
+                (paid_peers[0], PaidListEvidence::Confirmed),
+                (paid_peers[1], PaidListEvidence::Unresolved),
+                (paid_peers[2], PaidListEvidence::NotFound),
+            ],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumInconclusive),
+            "expected QuorumInconclusive, got {outcome:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dynamic thresholds with undersized sets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quorum_verified_with_undersized_quorum_targets() {
+        let key = xor_name_from_byte(0x50);
+        let config = ReplicationConfig::default();
+
+        // Only 2 quorum peers (undersized).
+        // quorum_needed = min(4, floor(2/2)+1) = min(4, 2) = 2
+        let quorum_peers: Vec<PeerId> = (1..=2).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), vec![]);
+
+        // Both Present -> 2 >= 2 -> QuorumVerified.
+        let evidence = build_evidence(
+            vec![
+                (quorum_peers[0], PresenceEvidence::Present),
+                (quorum_peers[1], PresenceEvidence::Present),
+            ],
+            vec![],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumVerified { ref sources } if sources.len() == 2),
+            "expected QuorumVerified with 2 sources, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn paid_list_verified_with_single_paid_peer() {
+        let key = xor_name_from_byte(0x60);
+        let config = ReplicationConfig::default();
+
+        // 1 paid peer, confirm_needed = floor(1/2)+1 = 1
+        let paid_peers = vec![peer_id_from_byte(10)];
+        // No quorum targets -> quorum path impossible from the start.
+        let targets = single_key_targets(&key, vec![], paid_peers.clone());
+
+        let evidence = build_evidence(vec![], vec![(paid_peers[0], PaidListEvidence::Confirmed)]);
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "expected PaidListVerified with single peer, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn quorum_fails_with_zero_targets_no_paid() {
+        let key = xor_name_from_byte(0x70);
+        let config = ReplicationConfig::default();
+
+        // No quorum peers, no paid peers.
+        // quorum_needed(0) = min(4, 1) = 1, but 0 positive + 0 unresolved < 1.
+        // confirm_needed(0) = 1, but 0 confirmed + 0 unresolved < 1.
+        let targets = single_key_targets(&key, vec![], vec![]);
+
+        let evidence = build_evidence(vec![], vec![]);
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumFailed),
+            "expected QuorumFailed with zero targets, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn quorum_verified_beats_paid_list_when_both_satisfied() {
+        // When both presence quorum AND paid-list majority are satisfied,
+        // QuorumVerified takes precedence (evaluated first).
+        let key = xor_name_from_byte(0x80);
+        let config = ReplicationConfig::default();
+
+        let quorum_peers: Vec<PeerId> = (1..=5).map(peer_id_from_byte).collect();
+        let paid_peers: Vec<PeerId> = (10..=12).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        // quorum_needed(5) = min(4, 3) = 3; all 5 Present -> quorum met.
+        // confirm_needed(3) = 2; all 3 Confirmed -> paid met.
+        let evidence = build_evidence(
+            vec![
+                (quorum_peers[0], PresenceEvidence::Present),
+                (quorum_peers[1], PresenceEvidence::Present),
+                (quorum_peers[2], PresenceEvidence::Present),
+                (quorum_peers[3], PresenceEvidence::Present),
+                (quorum_peers[4], PresenceEvidence::Present),
+            ],
+            vec![
+                (paid_peers[0], PaidListEvidence::Confirmed),
+                (paid_peers[1], PaidListEvidence::Confirmed),
+                (paid_peers[2], PaidListEvidence::Confirmed),
+            ],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumVerified { .. }),
+            "QuorumVerified should take precedence over PaidListVerified, got {outcome:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // process_verification_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn process_response_populates_evidence() {
+        let key = xor_name_from_byte(0x90);
+        let peer = peer_id_from_byte(1);
+
+        let targets = single_key_targets(&key, vec![peer], vec![peer]);
+
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [(
+            key,
+            KeyVerificationEvidence {
+                presence: HashMap::new(),
+                paid_list: HashMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let response = VerificationResponse {
+            results: vec![KeyVerificationResult {
+                key,
+                present: true,
+                paid: Some(true),
+            }],
+        };
+
+        process_verification_response(&peer, &response, &targets, &mut evidence);
+
+        let ev = evidence.get(&key).expect("evidence for key");
+        assert_eq!(
+            ev.presence.get(&peer),
+            Some(&PresenceEvidence::Present),
+            "presence should be Present"
+        );
+        assert_eq!(
+            ev.paid_list.get(&peer),
+            Some(&PaidListEvidence::Confirmed),
+            "paid_list should be Confirmed"
+        );
+    }
+
+    #[test]
+    fn process_response_missing_key_gets_unresolved() {
+        let key = xor_name_from_byte(0xA0);
+        let peer = peer_id_from_byte(2);
+
+        let targets = single_key_targets(&key, vec![peer], vec![peer]);
+
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [(
+            key,
+            KeyVerificationEvidence {
+                presence: HashMap::new(),
+                paid_list: HashMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        // Empty response: peer did not include our key.
+        let response = VerificationResponse { results: vec![] };
+
+        process_verification_response(&peer, &response, &targets, &mut evidence);
+
+        let ev = evidence.get(&key).expect("evidence for key");
+        assert_eq!(
+            ev.presence.get(&peer),
+            Some(&PresenceEvidence::Unresolved),
+            "missing key in response should be Unresolved"
+        );
+        assert_eq!(
+            ev.paid_list.get(&peer),
+            Some(&PaidListEvidence::Unresolved),
+            "missing paid key in response should be Unresolved"
+        );
+    }
+
+    #[test]
+    fn process_response_ignores_unsolicited_keys() {
+        let key = xor_name_from_byte(0xB0);
+        let unsolicited_key = xor_name_from_byte(0xB1);
+        let peer = peer_id_from_byte(3);
+
+        let targets = single_key_targets(&key, vec![peer], vec![]);
+
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [(
+            key,
+            KeyVerificationEvidence {
+                presence: HashMap::new(),
+                paid_list: HashMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        // Response includes an unsolicited key.
+        let response = VerificationResponse {
+            results: vec![
+                KeyVerificationResult {
+                    key: unsolicited_key,
+                    present: true,
+                    paid: None,
+                },
+                KeyVerificationResult {
+                    key,
+                    present: false,
+                    paid: None,
+                },
+            ],
+        };
+
+        process_verification_response(&peer, &response, &targets, &mut evidence);
+
+        // Unsolicited key should not appear in evidence.
+        assert!(
+            !evidence.contains_key(&unsolicited_key),
+            "unsolicited key should not be in evidence"
+        );
+
+        let ev = evidence.get(&key).expect("evidence for key");
+        assert_eq!(
+            ev.presence.get(&peer),
+            Some(&PresenceEvidence::Absent),
+            "solicited key should have Absent"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mark_peer_unresolved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mark_unresolved_sets_all_keys_for_peer() {
+        let key_a = xor_name_from_byte(0xC0);
+        let key_b = xor_name_from_byte(0xC1);
+        let peer = peer_id_from_byte(5);
+
+        // Peer is a quorum target for key_a and a paid target for key_b.
+        let targets = VerificationTargets {
+            quorum_targets: [(key_a, vec![peer])].into_iter().collect(),
+            paid_targets: [(key_b, vec![peer])].into_iter().collect(),
+            all_peers: [peer].into_iter().collect(),
+            peer_to_keys: [(peer, vec![key_a, key_b])].into_iter().collect(),
+            peer_to_paid_keys: [(peer, [key_b].into_iter().collect())]
+                .into_iter()
+                .collect(),
+        };
+
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [
+            (
+                key_a,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            ),
+            (
+                key_b,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        mark_peer_unresolved(&peer, &targets, &mut evidence);
+
+        let ev_a = evidence.get(&key_a).expect("evidence for key_a");
+        assert_eq!(
+            ev_a.presence.get(&peer),
+            Some(&PresenceEvidence::Unresolved)
+        );
+        // key_a is not in peer_to_paid_keys, so no paid_list entry.
+        assert!(ev_a.paid_list.get(&peer).is_none());
+
+        let ev_b = evidence.get(&key_b).expect("evidence for key_b");
+        assert_eq!(
+            ev_b.presence.get(&peer),
+            Some(&PresenceEvidence::Unresolved)
+        );
+        assert_eq!(
+            ev_b.paid_list.get(&peer),
+            Some(&PaidListEvidence::Unresolved)
+        );
+    }
+}

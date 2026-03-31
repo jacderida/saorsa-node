@@ -1,0 +1,503 @@
+//! Neighbor replication sync (Section 6.2).
+//!
+//! Round-robin cycle management: snapshot close neighbors, iterate through
+//! them in batches of `NEIGHBOR_SYNC_PEER_COUNT`, exchanging hint sets.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use rand::Rng;
+use saorsa_core::identity::PeerId;
+use saorsa_core::P2PNode;
+use tracing::{debug, warn};
+
+use crate::ant_protocol::XorName;
+use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
+use crate::replication::paid_list::PaidList;
+use crate::replication::protocol::{
+    NeighborSyncRequest, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
+};
+use crate::replication::types::NeighborSyncState;
+use crate::storage::LmdbStorage;
+
+/// Build replica hints for a specific peer.
+///
+/// Returns keys that we believe the peer should hold (peer is among the
+/// `CLOSE_GROUP_SIZE` nearest to `K` in our `SelfInclusiveRT`).
+pub async fn build_replica_hints_for_peer(
+    peer: &PeerId,
+    storage: &Arc<LmdbStorage>,
+    p2p_node: &Arc<P2PNode>,
+    close_group_size: usize,
+) -> Vec<XorName> {
+    let all_keys = match storage.all_keys() {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!("Failed to read stored keys for hint construction: {e}");
+            return Vec::new();
+        }
+    };
+
+    let dht = p2p_node.dht_manager();
+    let mut hints = Vec::new();
+    for key in all_keys {
+        let closest = dht
+            .find_closest_nodes_local_with_self(&key, close_group_size)
+            .await;
+        if closest.iter().any(|n| n.peer_id == *peer) {
+            hints.push(key);
+        }
+    }
+    hints
+}
+
+/// Build paid hints for a specific peer.
+///
+/// Returns keys from our `PaidForList` that we believe the peer should
+/// track (peer is among `PAID_LIST_CLOSE_GROUP_SIZE` nearest to `K`).
+pub async fn build_paid_hints_for_peer(
+    peer: &PeerId,
+    paid_list: &Arc<PaidList>,
+    p2p_node: &Arc<P2PNode>,
+    paid_list_close_group_size: usize,
+) -> Vec<XorName> {
+    let all_paid_keys = match paid_list.all_keys() {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!("Failed to read PaidForList for hint construction: {e}");
+            return Vec::new();
+        }
+    };
+
+    let dht = p2p_node.dht_manager();
+    let mut hints = Vec::new();
+    for key in all_paid_keys {
+        let closest = dht
+            .find_closest_nodes_local_with_self(&key, paid_list_close_group_size)
+            .await;
+        if closest.iter().any(|n| n.peer_id == *peer) {
+            hints.push(key);
+        }
+    }
+    hints
+}
+
+/// Take a fresh snapshot of close neighbors for a new round-robin cycle.
+///
+/// Rule 1: Compute `CloseNeighbors(self)` as `NEIGHBOR_SYNC_SCOPE` nearest
+/// peers.
+pub async fn snapshot_close_neighbors(
+    p2p_node: &Arc<P2PNode>,
+    self_id: &PeerId,
+    scope: usize,
+) -> Vec<PeerId> {
+    let self_xor: XorName = *self_id.as_bytes();
+    let closest = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local(&self_xor, scope)
+        .await;
+    closest.iter().map(|n| n.peer_id).collect()
+}
+
+/// Select the next batch of peers for sync from the current cycle.
+///
+/// Rules 2-3: Scan forward from cursor, skip peers still under cooldown,
+/// fill up to `peer_count` slots.
+pub fn select_sync_batch(
+    state: &mut NeighborSyncState,
+    peer_count: usize,
+    cooldown: Duration,
+) -> Vec<PeerId> {
+    let mut batch = Vec::new();
+    let now = Instant::now();
+
+    while batch.len() < peer_count && state.cursor < state.order.len() {
+        let peer = state.order[state.cursor];
+
+        // Check cooldown (Rule 2a): if the peer was synced recently, remove
+        // from the snapshot and continue without advancing the cursor (the
+        // next element slides into the current cursor position).
+        if let Some(last_sync) = state.last_sync_times.get(&peer) {
+            if now.duration_since(*last_sync) < cooldown {
+                state.order.remove(state.cursor);
+                continue;
+            }
+        }
+
+        batch.push(peer);
+        state.cursor += 1;
+    }
+
+    batch
+}
+
+/// Execute a sync session with a single peer.
+///
+/// Returns the response hints if sync succeeded, or `None` if the peer
+/// was unreachable or the response could not be decoded.
+pub async fn sync_with_peer(
+    peer: &PeerId,
+    p2p_node: &Arc<P2PNode>,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    config: &ReplicationConfig,
+    is_bootstrapping: bool,
+) -> Option<NeighborSyncResponse> {
+    // Build peer-targeted hint sets (Rule 7).
+    let replica_hints =
+        build_replica_hints_for_peer(peer, storage, p2p_node, config.close_group_size).await;
+    let paid_hints =
+        build_paid_hints_for_peer(peer, paid_list, p2p_node, config.paid_list_close_group_size)
+            .await;
+
+    let request = NeighborSyncRequest {
+        replica_hints,
+        paid_hints,
+        bootstrapping: is_bootstrapping,
+    };
+    let request_id = rand::thread_rng().gen::<u64>();
+    let msg = ReplicationMessage {
+        request_id,
+        body: ReplicationMessageBody::NeighborSyncRequest(request),
+    };
+
+    let encoded = match msg.encode() {
+        Ok(data) => data,
+        Err(e) => {
+            warn!("Failed to encode sync request for {peer}: {e}");
+            return None;
+        }
+    };
+
+    let response = match p2p_node
+        .send_request(
+            peer,
+            REPLICATION_PROTOCOL_ID,
+            encoded,
+            config.verification_request_timeout,
+        )
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            debug!("Sync with {peer} failed: {e}");
+            return None;
+        }
+    };
+
+    match ReplicationMessage::decode(&response.data) {
+        Ok(decoded) => {
+            if let ReplicationMessageBody::NeighborSyncResponse(resp) = decoded.body {
+                Some(resp)
+            } else {
+                warn!("Unexpected response type from {peer} during sync");
+                None
+            }
+        }
+        Err(e) => {
+            warn!("Failed to decode sync response from {peer}: {e}");
+            None
+        }
+    }
+}
+
+/// Handle a failed sync attempt: remove peer from snapshot and try to fill
+/// the vacated slot.
+///
+/// Rule 3: Remove unreachable peer from `NeighborSyncOrder`, attempt to fill
+/// by resuming scan from where rule 2 left off.
+pub fn handle_sync_failure(state: &mut NeighborSyncState, failed_peer: &PeerId) -> Option<PeerId> {
+    // Find and remove the failed peer from the ordering.
+    if let Some(pos) = state.order.iter().position(|p| p == failed_peer) {
+        state.order.remove(pos);
+        // Adjust cursor if removal was before the current cursor position.
+        if pos < state.cursor {
+            state.cursor = state.cursor.saturating_sub(1);
+        }
+    }
+
+    // Try to fill the vacated slot from the remaining peers in the snapshot.
+    if state.cursor < state.order.len() {
+        let next_peer = state.order[state.cursor];
+        state.cursor += 1;
+        Some(next_peer)
+    } else {
+        None
+    }
+}
+
+/// Record a successful sync with a peer.
+pub fn record_successful_sync(state: &mut NeighborSyncState, peer: &PeerId) {
+    state.last_sync_times.insert(*peer, Instant::now());
+}
+
+/// Handle incoming sync request from a peer.
+///
+/// Rules 4-6: Validate peer is in `LocalRT`. If yes, bidirectional sync.
+/// If not, outbound-only (send hints but don't accept inbound).
+///
+/// Returns `(response, sender_in_routing_table)` where the second element
+/// indicates whether the caller should process the sender's inbound hints.
+pub async fn handle_sync_request(
+    sender: &PeerId,
+    _request: &NeighborSyncRequest,
+    p2p_node: &Arc<P2PNode>,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    config: &ReplicationConfig,
+    is_bootstrapping: bool,
+) -> (NeighborSyncResponse, bool) {
+    let sender_in_rt = p2p_node.dht_manager().is_in_routing_table(sender).await;
+
+    // Build outbound hints (always sent, even to non-RT peers).
+    let replica_hints =
+        build_replica_hints_for_peer(sender, storage, p2p_node, config.close_group_size).await;
+    let paid_hints = build_paid_hints_for_peer(
+        sender,
+        paid_list,
+        p2p_node,
+        config.paid_list_close_group_size,
+    )
+    .await;
+
+    let response = NeighborSyncResponse {
+        replica_hints,
+        paid_hints,
+        bootstrapping: is_bootstrapping,
+        rejected_keys: Vec::new(),
+    };
+
+    // Rule 4-6: accept inbound hints only if sender is in LocalRT.
+    (response, sender_in_rt)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Build a `PeerId` from a single byte (zero-padded to 32 bytes).
+    fn peer_id_from_byte(b: u8) -> PeerId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = b;
+        PeerId::from_bytes(bytes)
+    }
+
+    // -- select_sync_batch ---------------------------------------------------
+
+    #[test]
+    fn select_sync_batch_returns_up_to_peer_count() {
+        let peers = vec![
+            peer_id_from_byte(1),
+            peer_id_from_byte(2),
+            peer_id_from_byte(3),
+            peer_id_from_byte(4),
+            peer_id_from_byte(5),
+        ];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let batch_size = 3;
+
+        let batch = select_sync_batch(&mut state, batch_size, Duration::from_secs(0));
+
+        assert_eq!(batch.len(), batch_size);
+        assert_eq!(batch[0], peer_id_from_byte(1));
+        assert_eq!(batch[1], peer_id_from_byte(2));
+        assert_eq!(batch[2], peer_id_from_byte(3));
+        assert_eq!(state.cursor, 3);
+    }
+
+    #[test]
+    fn select_sync_batch_skips_cooldown_peers() {
+        let peers = vec![
+            peer_id_from_byte(1),
+            peer_id_from_byte(2),
+            peer_id_from_byte(3),
+            peer_id_from_byte(4),
+        ];
+        let mut state = NeighborSyncState::new_cycle(peers);
+
+        // Mark peer 1 and peer 3 as recently synced.
+        state
+            .last_sync_times
+            .insert(peer_id_from_byte(1), Instant::now());
+        state
+            .last_sync_times
+            .insert(peer_id_from_byte(3), Instant::now());
+
+        let cooldown = Duration::from_secs(3600); // 1 hour
+        let batch = select_sync_batch(&mut state, 2, cooldown);
+
+        // Peer 1 and peer 3 should be skipped (removed from order).
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0], peer_id_from_byte(2));
+        assert_eq!(batch[1], peer_id_from_byte(4));
+
+        // Cooldown peers should have been removed from the order.
+        assert!(!state.order.contains(&peer_id_from_byte(1)));
+        assert!(!state.order.contains(&peer_id_from_byte(3)));
+    }
+
+    #[test]
+    fn select_sync_batch_expired_cooldown_not_skipped() {
+        let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+
+        // Mark peer 1 as synced a long time ago (simulate expired cooldown).
+        state.last_sync_times.insert(
+            peer_id_from_byte(1),
+            Instant::now() - Duration::from_secs(7200),
+        );
+
+        let cooldown = Duration::from_secs(3600);
+        let batch = select_sync_batch(&mut state, 2, cooldown);
+
+        // Peer 1's cooldown expired so it should be included.
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0], peer_id_from_byte(1));
+        assert_eq!(batch[1], peer_id_from_byte(2));
+    }
+
+    #[test]
+    fn select_sync_batch_empty_order() {
+        let mut state = NeighborSyncState::new_cycle(vec![]);
+
+        let batch = select_sync_batch(&mut state, 4, Duration::from_secs(0));
+
+        assert!(batch.is_empty());
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn select_sync_batch_all_on_cooldown() {
+        let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+
+        state
+            .last_sync_times
+            .insert(peer_id_from_byte(1), Instant::now());
+        state
+            .last_sync_times
+            .insert(peer_id_from_byte(2), Instant::now());
+
+        let cooldown = Duration::from_secs(3600);
+        let batch = select_sync_batch(&mut state, 4, cooldown);
+
+        assert!(batch.is_empty());
+        assert!(state.order.is_empty());
+    }
+
+    // -- handle_sync_failure -------------------------------------------------
+
+    #[test]
+    fn handle_sync_failure_removes_peer_and_adjusts_cursor() {
+        let peers = vec![
+            peer_id_from_byte(1),
+            peer_id_from_byte(2),
+            peer_id_from_byte(3),
+            peer_id_from_byte(4),
+        ];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        // Simulate having already processed peers at indices 0 and 1.
+        state.cursor = 2;
+
+        // Peer 2 (index 1, before cursor) fails.
+        let replacement = handle_sync_failure(&mut state, &peer_id_from_byte(2));
+
+        // Cursor should be adjusted down by 1 (was 2, now 1).
+        assert_eq!(state.cursor, 2); // was 2, removed at pos 1, adjusted to 1, then replacement advances to 2
+        assert!(!state.order.contains(&peer_id_from_byte(2)));
+
+        // Should get peer 4 as replacement (index 1 after removal = peer 3,
+        // but cursor was adjusted to 1 so peer 3 is at index 1; it returns
+        // the peer at the new cursor and advances).
+        assert!(replacement.is_some());
+    }
+
+    #[test]
+    fn handle_sync_failure_removes_peer_after_cursor() {
+        let peers = vec![
+            peer_id_from_byte(1),
+            peer_id_from_byte(2),
+            peer_id_from_byte(3),
+            peer_id_from_byte(4),
+        ];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        state.cursor = 1;
+
+        // Peer 3 (index 2, after cursor) fails.
+        let replacement = handle_sync_failure(&mut state, &peer_id_from_byte(3));
+
+        // Cursor should stay at 1 (removal was after cursor).
+        assert_eq!(state.cursor, 2); // cursor was 1, replacement advances to 2
+        assert!(!state.order.contains(&peer_id_from_byte(3)));
+
+        // Replacement should be peer 2 (now at cursor position 1).
+        assert_eq!(replacement, Some(peer_id_from_byte(2)));
+    }
+
+    #[test]
+    fn handle_sync_failure_no_replacement_when_exhausted() {
+        let peers = vec![peer_id_from_byte(1)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        state.cursor = 1; // Already past the only peer.
+
+        let replacement = handle_sync_failure(&mut state, &peer_id_from_byte(1));
+
+        assert!(state.order.is_empty());
+        assert!(replacement.is_none());
+    }
+
+    #[test]
+    fn handle_sync_failure_unknown_peer_is_noop() {
+        let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        state.cursor = 1;
+
+        let replacement = handle_sync_failure(&mut state, &peer_id_from_byte(99));
+
+        // Order should be unchanged.
+        assert_eq!(state.order.len(), 2);
+        // Still tries to fill from cursor.
+        assert_eq!(replacement, Some(peer_id_from_byte(2)));
+        assert_eq!(state.cursor, 2);
+    }
+
+    // -- record_successful_sync ----------------------------------------------
+
+    #[test]
+    fn record_successful_sync_updates_last_sync_time() {
+        let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let peer = peer_id_from_byte(1);
+
+        assert!(!state.last_sync_times.contains_key(&peer));
+
+        let before = Instant::now();
+        record_successful_sync(&mut state, &peer);
+        let after = Instant::now();
+
+        let ts = state.last_sync_times.get(&peer).expect("timestamp exists");
+        assert!(*ts >= before);
+        assert!(*ts <= after);
+    }
+
+    #[test]
+    fn record_successful_sync_overwrites_previous() {
+        let peers = vec![peer_id_from_byte(1)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let peer = peer_id_from_byte(1);
+
+        // Record a sync at an old time.
+        let old_time = Instant::now() - Duration::from_secs(3600);
+        state.last_sync_times.insert(peer, old_time);
+
+        record_successful_sync(&mut state, &peer);
+
+        let ts = state.last_sync_times.get(&peer).expect("timestamp exists");
+        assert!(*ts > old_time, "sync time should be updated");
+    }
+}

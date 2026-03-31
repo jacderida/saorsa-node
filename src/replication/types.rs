@@ -1,0 +1,607 @@
+//! Core types for the replication subsystem.
+//!
+//! These types represent the state machine states, queue entries, and domain
+//! concepts from the Kademlia-style replication design (see
+//! `docs/REPLICATION_DESIGN.md`).
+
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+use crate::ant_protocol::XorName;
+use saorsa_core::identity::PeerId;
+
+// ---------------------------------------------------------------------------
+// Verification state machine (Section 8 of REPLICATION_DESIGN.md)
+// ---------------------------------------------------------------------------
+
+/// Verification state machine.
+///
+/// Each unknown key transitions through these states exactly once per offer
+/// lifecycle.  See Section 8 of `REPLICATION_DESIGN.md` for the full
+/// state-transition diagram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationState {
+    /// Offer received, not yet processed.
+    OfferReceived,
+    /// Passed admission filter, awaiting quorum / paid-list verification.
+    PendingVerify,
+    /// Presence quorum passed (>= `QuorumNeeded` positives from
+    /// `QuorumTargets`).
+    QuorumVerified,
+    /// Paid-list authorisation succeeded (>= `ConfirmNeeded` confirmations or
+    /// derived from replica majority).
+    PaidListVerified,
+    /// Queued for record fetch.
+    QueuedForFetch,
+    /// Actively fetching from a verified source.
+    Fetching,
+    /// Successfully stored locally.
+    Stored,
+    /// Fetch failed but retryable (alternate sources remain).
+    FetchRetryable,
+    /// Fetch permanently abandoned (terminal failure or no alternate sources).
+    FetchAbandoned,
+    /// Quorum failed definitively (both paid-list and presence impossible this
+    /// round).
+    QuorumFailed,
+    /// Quorum inconclusive (timeout with neither success nor fail-fast).
+    QuorumInconclusive,
+    /// Terminal: quorum abandoned, key forgotten.
+    QuorumAbandoned,
+    /// Terminal: key returned to idle (forgotten, requires new offer to
+    /// re-enter).
+    Idle,
+}
+
+// ---------------------------------------------------------------------------
+// Hint pipeline classification
+// ---------------------------------------------------------------------------
+
+/// Whether a key was admitted via replica hints or paid hints only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HintPipeline {
+    /// Key is in the admitted replica-hint pipeline (fetch-eligible).
+    Replica,
+    /// Key is in the paid-hint-only pipeline (`PaidForList` update only, no
+    /// fetch).
+    PaidOnly,
+}
+
+// ---------------------------------------------------------------------------
+// Pending-verification table entry
+// ---------------------------------------------------------------------------
+
+/// Entry in the pending-verification table.
+///
+/// Tracks a single key through the verification FSM, recording which peers
+/// responded and which have been tried for fetch.
+#[derive(Debug, Clone)]
+pub struct VerificationEntry {
+    /// Current state in the verification FSM.
+    pub state: VerificationState,
+    /// Which pipeline admitted this key.
+    pub pipeline: HintPipeline,
+    /// Peers that responded `Present` during verification (verified fetch
+    /// sources).
+    pub verified_sources: Vec<PeerId>,
+    /// Peers already tried for fetch (to avoid retrying the same source).
+    pub tried_sources: HashSet<PeerId>,
+    /// When this entry was created.
+    pub created_at: Instant,
+    /// The peer that originally hinted this key (for source tracking).
+    pub hint_sender: PeerId,
+}
+
+// ---------------------------------------------------------------------------
+// Fetch queue candidate
+// ---------------------------------------------------------------------------
+
+/// A candidate queued for fetch, ordered by relevance (nearest-first).
+///
+/// Implements [`Ord`] with *reversed* distance comparison so that a
+/// [`BinaryHeap`](std::collections::BinaryHeap) (max-heap) dequeues the
+/// nearest key first.
+#[derive(Debug, Clone)]
+pub struct FetchCandidate {
+    /// The key to fetch.
+    pub key: XorName,
+    /// XOR distance from self to key (for priority ordering).
+    pub distance: XorName,
+    /// Verified source peers that responded `Present`.
+    pub sources: Vec<PeerId>,
+    /// Sources already tried (failed).
+    pub tried: HashSet<PeerId>,
+}
+
+impl Eq for FetchCandidate {}
+
+impl PartialEq for FetchCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Ord for FetchCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse ordering: smaller distance = higher priority (BinaryHeap is
+        // max-heap).
+        other.distance.cmp(&self.distance)
+    }
+}
+
+impl PartialOrd for FetchCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verification evidence types
+// ---------------------------------------------------------------------------
+
+/// Per-key presence evidence from a verification round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PresenceEvidence {
+    /// Peer holds the record.
+    Present,
+    /// Peer does not hold the record.
+    Absent,
+    /// Peer did not respond in time (neutral, not negative).
+    Unresolved,
+}
+
+/// Per-key paid-list evidence from a verification round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaidListEvidence {
+    /// Peer confirms key is in its `PaidForList`.
+    Confirmed,
+    /// Peer says key is NOT in its `PaidForList`.
+    NotFound,
+    /// Peer did not respond in time (neutral).
+    Unresolved,
+}
+
+/// Aggregated verification evidence for a single key from one verification
+/// round.
+#[derive(Debug, Clone)]
+pub struct KeyVerificationEvidence {
+    /// Presence evidence per peer (from `QuorumTargets`).
+    pub presence: HashMap<PeerId, PresenceEvidence>,
+    /// Paid-list evidence per peer (from `PaidTargets`).
+    pub paid_list: HashMap<PeerId, PaidListEvidence>,
+}
+
+// ---------------------------------------------------------------------------
+// Failure evidence (Section 14 — TrustEngine integration)
+// ---------------------------------------------------------------------------
+
+/// Failure evidence types emitted to `TrustEngine` (Section 14).
+#[derive(Debug, Clone)]
+pub enum FailureEvidence {
+    /// Failed fetch attempt from a source peer.
+    ReplicationFailure {
+        /// The peer that failed to serve the record.
+        peer: PeerId,
+        /// The key that could not be fetched.
+        key: XorName,
+    },
+    /// Audit failure with confirmed responsible keys.
+    AuditFailure {
+        /// Unique identifier for the audit challenge.
+        challenge_id: u64,
+        /// The peer that was challenged.
+        challenged_peer: PeerId,
+        /// Keys confirmed as failed.
+        confirmed_failed_keys: Vec<XorName>,
+        /// Why the audit failed.
+        reason: AuditFailureReason,
+    },
+    /// Peer claiming bootstrap past grace period.
+    BootstrapClaimAbuse {
+        /// The offending peer.
+        peer: PeerId,
+        /// When this peer was first seen.
+        first_seen: Instant,
+    },
+}
+
+/// Reason for audit failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditFailureReason {
+    /// Peer timed out (no response within deadline).
+    Timeout,
+    /// Response was malformed.
+    MalformedResponse,
+    /// One or more per-key digest mismatches.
+    DigestMismatch,
+    /// Key was absent (signalled by sentinel digest).
+    KeyAbsent,
+}
+
+// ---------------------------------------------------------------------------
+// Peer sync tracking
+// ---------------------------------------------------------------------------
+
+/// Record of sync history with a peer, for `RepairOpportunity` tracking.
+#[derive(Debug, Clone)]
+pub struct PeerSyncRecord {
+    /// Last time we successfully synced with this peer.
+    pub last_sync: Option<Instant>,
+    /// Number of full neighbor-sync cycles completed since last sync with this
+    /// peer.
+    pub cycles_since_sync: u32,
+}
+
+impl PeerSyncRecord {
+    /// Whether this peer has had a repair opportunity (synced at least once
+    /// and at least one subsequent cycle has completed).
+    #[must_use]
+    pub fn has_repair_opportunity(&self) -> bool {
+        self.last_sync.is_some() && self.cycles_since_sync >= 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Neighbor sync cycle state
+// ---------------------------------------------------------------------------
+
+/// Neighbor sync cycle state.
+///
+/// Tracks a deterministic walk through the current close-group snapshot,
+/// per-peer cooldown times, and bootstrap claim first-seen timestamps.
+#[derive(Debug)]
+pub struct NeighborSyncState {
+    /// Deterministic ordering of peers for the current cycle (snapshot).
+    pub order: Vec<PeerId>,
+    /// Current cursor position into `order`.
+    pub cursor: usize,
+    /// Per-peer last successful sync time (for cooldown).
+    pub last_sync_times: HashMap<PeerId, Instant>,
+    /// Bootstrap claim first-seen timestamps per peer.
+    pub bootstrap_claims: HashMap<PeerId, Instant>,
+}
+
+impl NeighborSyncState {
+    /// Create a new cycle from the given close neighbors.
+    #[must_use]
+    pub fn new_cycle(close_neighbors: Vec<PeerId>) -> Self {
+        Self {
+            order: close_neighbors,
+            cursor: 0,
+            last_sync_times: HashMap::new(),
+            bootstrap_claims: HashMap::new(),
+        }
+    }
+
+    /// Whether the current cycle is complete.
+    #[must_use]
+    pub fn is_cycle_complete(&self) -> bool {
+        self.cursor >= self.order.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Topology change classification (Section 13)
+// ---------------------------------------------------------------------------
+
+/// Topology change classification for churn handling (Section 13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyEventKind {
+    /// Genuine close-group change — run neighbor sync.
+    Trigger,
+    /// Probable restart churn — suppress.
+    Skip,
+    /// Far peer change — no action needed.
+    Ignore,
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap drain state (Section 16)
+// ---------------------------------------------------------------------------
+
+/// Bootstrap drain state tracking (Section 16).
+#[derive(Debug)]
+pub struct BootstrapState {
+    /// Whether bootstrap is complete (all peer requests done, queues empty).
+    pub drained: bool,
+    /// Number of bootstrap peer requests still pending.
+    pub pending_peer_requests: usize,
+    /// Keys discovered during bootstrap that are still in the verification /
+    /// fetch pipeline.
+    pub pending_keys: HashSet<XorName>,
+}
+
+impl BootstrapState {
+    /// Create initial bootstrap state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            drained: false,
+            pending_peer_requests: 0,
+            pending_keys: HashSet::new(),
+        }
+    }
+
+    /// Check if bootstrap is drained (all requests done AND all queues empty).
+    #[must_use]
+    pub fn is_drained(&self) -> bool {
+        self.drained || (self.pending_peer_requests == 0 && self.pending_keys.is_empty())
+    }
+}
+
+impl Default for BootstrapState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BinaryHeap, HashSet};
+
+    use super::*;
+
+    /// Helper: build a `PeerId` from a single byte (zero-padded to 32 bytes).
+    fn peer_id_from_byte(b: u8) -> PeerId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = b;
+        PeerId::from_bytes(bytes)
+    }
+
+    // -- FetchCandidate ordering -------------------------------------------
+
+    #[test]
+    fn fetch_candidate_nearest_key_has_highest_priority() {
+        let near = FetchCandidate {
+            key: [1u8; 32],
+            distance: [
+                0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0,
+            ],
+            sources: vec![peer_id_from_byte(1)],
+            tried: HashSet::new(),
+        };
+
+        let far = FetchCandidate {
+            key: [2u8; 32],
+            distance: [
+                0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0,
+            ],
+            sources: vec![peer_id_from_byte(2)],
+            tried: HashSet::new(),
+        };
+
+        // In a max-heap the "greatest" element pops first.
+        // Our reversed Ord makes smaller-distance candidates greater.
+        assert!(near > far, "nearer candidate should compare greater");
+
+        let mut heap = BinaryHeap::new();
+        heap.push(far.clone());
+        heap.push(near.clone());
+
+        assert_eq!(heap.len(), 2, "heap should contain both candidates");
+
+        let first = heap.pop();
+        assert!(first.is_some(), "first pop should succeed");
+        assert_eq!(
+            first.map(|c| c.key),
+            Some(near.key),
+            "nearest key should pop first"
+        );
+
+        let second = heap.pop();
+        assert!(second.is_some(), "second pop should succeed");
+        assert_eq!(
+            second.map(|c| c.key),
+            Some(far.key),
+            "farthest key should pop second"
+        );
+    }
+
+    #[test]
+    fn fetch_candidate_equal_distance_is_equal_ordering() {
+        let a = FetchCandidate {
+            key: [1u8; 32],
+            distance: [5u8; 32],
+            sources: vec![],
+            tried: HashSet::new(),
+        };
+
+        let b = FetchCandidate {
+            key: [2u8; 32],
+            distance: [5u8; 32],
+            sources: vec![],
+            tried: HashSet::new(),
+        };
+
+        assert_eq!(
+            a.cmp(&b),
+            Ordering::Equal,
+            "equal distances should yield Equal ordering"
+        );
+    }
+
+    // -- PeerSyncRecord ----------------------------------------------------
+
+    #[test]
+    fn peer_sync_record_no_sync_yet() {
+        let record = PeerSyncRecord {
+            last_sync: None,
+            cycles_since_sync: 0,
+        };
+        assert!(
+            !record.has_repair_opportunity(),
+            "never-synced peer has no repair opportunity"
+        );
+    }
+
+    #[test]
+    fn peer_sync_record_synced_but_no_cycle() {
+        let record = PeerSyncRecord {
+            last_sync: Some(Instant::now()),
+            cycles_since_sync: 0,
+        };
+        assert!(
+            !record.has_repair_opportunity(),
+            "synced peer with zero subsequent cycles has no repair opportunity"
+        );
+    }
+
+    #[test]
+    fn peer_sync_record_synced_with_cycle() {
+        let record = PeerSyncRecord {
+            last_sync: Some(Instant::now()),
+            cycles_since_sync: 1,
+        };
+        assert!(
+            record.has_repair_opportunity(),
+            "synced peer with >= 1 cycle should have repair opportunity"
+        );
+    }
+
+    #[test]
+    fn peer_sync_record_no_sync_many_cycles() {
+        let record = PeerSyncRecord {
+            last_sync: None,
+            cycles_since_sync: 10,
+        };
+        assert!(
+            !record.has_repair_opportunity(),
+            "never-synced peer has no repair opportunity regardless of cycle count"
+        );
+    }
+
+    // -- NeighborSyncState -------------------------------------------------
+
+    #[test]
+    fn neighbor_sync_empty_cycle_is_immediately_complete() {
+        let state = NeighborSyncState::new_cycle(vec![]);
+        assert!(
+            state.is_cycle_complete(),
+            "empty neighbor list means cycle is complete"
+        );
+    }
+
+    #[test]
+    fn neighbor_sync_new_cycle_not_complete() {
+        let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
+        let state = NeighborSyncState::new_cycle(peers);
+        assert!(
+            !state.is_cycle_complete(),
+            "fresh cycle with peers should not be complete"
+        );
+    }
+
+    #[test]
+    fn neighbor_sync_cycle_completes_when_cursor_reaches_end() {
+        let peers = vec![
+            peer_id_from_byte(1),
+            peer_id_from_byte(2),
+            peer_id_from_byte(3),
+        ];
+        let mut state = NeighborSyncState::new_cycle(peers);
+
+        // Simulate stepping through the cycle.
+        state.cursor = 2;
+        assert!(
+            !state.is_cycle_complete(),
+            "cursor at len-1 should not be complete"
+        );
+
+        state.cursor = 3;
+        assert!(
+            state.is_cycle_complete(),
+            "cursor at len should be complete"
+        );
+    }
+
+    #[test]
+    fn neighbor_sync_cursor_past_end_is_still_complete() {
+        let peers = vec![peer_id_from_byte(1)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        state.cursor = 5;
+        assert!(
+            state.is_cycle_complete(),
+            "cursor past end should still report complete"
+        );
+    }
+
+    // -- BootstrapState ----------------------------------------------------
+
+    #[test]
+    fn bootstrap_state_initial_is_drained() {
+        // A freshly created state has zero pending requests and no keys,
+        // so `is_drained()` returns true even though `drained` is false.
+        let state = BootstrapState::new();
+        assert!(
+            state.is_drained(),
+            "initial state with no pending work should be drained"
+        );
+    }
+
+    #[test]
+    fn bootstrap_state_pending_requests_block_drain() {
+        let mut state = BootstrapState::new();
+        state.pending_peer_requests = 3;
+        assert!(
+            !state.is_drained(),
+            "pending peer requests should block drain"
+        );
+    }
+
+    #[test]
+    fn bootstrap_state_pending_keys_block_drain() {
+        let mut state = BootstrapState::new();
+        state.pending_keys.insert([42u8; 32]);
+        assert!(!state.is_drained(), "pending keys should block drain");
+    }
+
+    #[test]
+    fn bootstrap_state_explicit_drained_overrides() {
+        let mut state = BootstrapState::new();
+        state.pending_peer_requests = 5;
+        state.pending_keys.insert([99u8; 32]);
+        state.drained = true;
+        assert!(
+            state.is_drained(),
+            "explicit drained flag should override pending counts"
+        );
+    }
+
+    #[test]
+    fn bootstrap_state_drains_when_all_work_complete() {
+        let mut state = BootstrapState::new();
+        state.pending_peer_requests = 2;
+        state.pending_keys.insert([1u8; 32]);
+
+        // Simulate completing work.
+        state.pending_peer_requests = 0;
+        state.pending_keys.clear();
+
+        assert!(
+            state.is_drained(),
+            "should be drained when all work completes"
+        );
+    }
+
+    #[test]
+    fn bootstrap_state_default_matches_new() {
+        let from_new = BootstrapState::new();
+        let from_default = BootstrapState::default();
+
+        assert_eq!(from_new.drained, from_default.drained);
+        assert_eq!(
+            from_new.pending_peer_requests,
+            from_default.pending_peer_requests
+        );
+        assert_eq!(from_new.pending_keys, from_default.pending_keys);
+    }
+}

@@ -82,6 +82,18 @@ impl AntProtocol {
         CHUNK_PROTOCOL_ID
     }
 
+    /// Get a reference to the underlying LMDB storage.
+    #[must_use]
+    pub fn storage(&self) -> Arc<LmdbStorage> {
+        Arc::clone(&self.storage)
+    }
+
+    /// Get a shared reference to the payment verifier.
+    #[must_use]
+    pub fn payment_verifier_arc(&self) -> Arc<PaymentVerifier> {
+        Arc::clone(&self.payment_verifier)
+    }
+
     /// Handle an incoming request and produce a response.
     ///
     /// Decodes the raw message, processes it if it is a request variant,

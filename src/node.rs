@@ -10,6 +10,8 @@ use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEvent
 use crate::payment::metrics::QuotingMetricsTracker;
 use crate::payment::wallet::parse_rewards_address;
 use crate::payment::{EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
+use crate::replication::config::ReplicationConfig;
+use crate::replication::ReplicationEngine;
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{
     upgrade_cache_dir, AutoApplyUpgrader, BinaryCache, ReleaseCache, UpgradeMonitor, UpgradeResult,
@@ -133,15 +135,43 @@ impl NodeBuilder {
             None
         };
 
+        let p2p_arc = Arc::new(p2p_node);
+
+        // Initialize replication engine (if storage is enabled)
+        let replication_engine = if let Some(ref protocol) = ant_protocol {
+            let repl_config = ReplicationConfig::default();
+            let storage_arc = protocol.storage();
+            let payment_verifier_arc = protocol.payment_verifier_arc();
+            match ReplicationEngine::new(
+                repl_config,
+                Arc::clone(&p2p_arc),
+                storage_arc,
+                payment_verifier_arc,
+                &self.config.root_dir,
+                shutdown.clone(),
+            )
+            .await
+            {
+                Ok(engine) => Some(engine),
+                Err(e) => {
+                    warn!("Failed to initialize replication engine: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let node = RunningNode {
             config: self.config,
-            p2p_node: Arc::new(p2p_node),
+            p2p_node: p2p_arc,
             shutdown,
             events_tx,
             events_rx: Some(events_rx),
             upgrade_monitor,
             bootstrap_manager,
             ant_protocol,
+            replication_engine,
             protocol_task: None,
             upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
@@ -431,6 +461,8 @@ pub struct RunningNode {
     bootstrap_manager: Option<BootstrapManager>,
     /// ANT protocol handler for chunk storage.
     ant_protocol: Option<Arc<AntProtocol>>,
+    /// Replication engine (manages neighbor sync, verification, audits).
+    replication_engine: Option<ReplicationEngine>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
@@ -492,6 +524,12 @@ impl RunningNode {
 
         // Start protocol message routing (P2P → AntProtocol → P2P response)
         self.start_protocol_routing();
+
+        // Start replication engine background tasks
+        if let Some(ref mut engine) = self.replication_engine {
+            engine.start();
+            info!("Replication engine started");
+        }
 
         // Start upgrade monitor if enabled
         if let Some(monitor) = self.upgrade_monitor.take() {

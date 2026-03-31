@@ -1,0 +1,1711 @@
+//! Replication subsystem for the Autonomi network.
+//!
+//! Implements Kademlia-style replication with:
+//! - Fresh replication with `PoP` verification
+//! - Neighbor sync with round-robin cycle management
+//! - Batched quorum verification
+//! - Storage audit protocol (anti-outsourcing)
+//! - `PaidForList` persistence and convergence
+//! - Responsibility pruning with hysteresis
+
+// The replication engine intentionally holds `RwLock` read guards across await
+// boundaries (e.g. reading sync_history while calling audit_tick). Clippy's
+// nursery lint `significant_drop_tightening` flags these, but the guards must
+// remain live for the duration of the call.
+#![allow(clippy::significant_drop_tightening)]
+
+pub mod admission;
+pub mod audit;
+pub mod bootstrap;
+pub mod config;
+pub mod fresh;
+pub mod neighbor_sync;
+pub mod paid_list;
+pub mod protocol;
+pub mod pruning;
+pub mod quorum;
+pub mod scheduling;
+pub mod types;
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
+
+use rand::Rng;
+use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
+
+use crate::ant_protocol::XorName;
+use crate::error::{Error, Result};
+use crate::payment::PaymentVerifier;
+use crate::replication::audit::AuditTickResult;
+use crate::replication::config::{
+    ReplicationConfig, MAX_PARALLEL_FETCH_NORMAL, REPLICATION_PROTOCOL_ID,
+};
+use crate::replication::paid_list::PaidList;
+use crate::replication::protocol::{
+    FreshReplicationResponse, ReplicationMessage, ReplicationMessageBody, VerificationResponse,
+};
+use crate::replication::quorum::KeyVerificationOutcome;
+use crate::replication::scheduling::ReplicationQueues;
+use crate::replication::types::{
+    BootstrapState, FailureEvidence, HintPipeline, NeighborSyncState, PeerSyncRecord,
+    TopologyEventKind, VerificationEntry, VerificationState,
+};
+use crate::storage::LmdbStorage;
+use saorsa_core::identity::PeerId;
+use saorsa_core::{P2PEvent, P2PNode, TrustEvent};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Fetch worker polling interval in milliseconds.
+const FETCH_WORKER_POLL_MS: u64 = 100;
+
+/// Verification worker polling interval in milliseconds.
+const VERIFICATION_WORKER_POLL_MS: u64 = 250;
+
+/// Bootstrap drain check interval in seconds.
+const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
+
+/// Standard trust event weight for per-operation success/failure signals.
+///
+/// Used for individual replication fetch outcomes, integrity check failures,
+/// and bootstrap claim abuse. Distinct from `MAX_CONSUMER_TRUST_WEIGHT` which
+/// is reserved for confirmed audit failures.
+const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
+
+// ---------------------------------------------------------------------------
+// ReplicationEngine
+// ---------------------------------------------------------------------------
+
+/// The replication engine manages all replication background tasks and state.
+pub struct ReplicationEngine {
+    /// Replication configuration (shared across spawned tasks).
+    config: Arc<ReplicationConfig>,
+    /// P2P networking node.
+    p2p_node: Arc<P2PNode>,
+    /// Local chunk storage.
+    storage: Arc<LmdbStorage>,
+    /// Persistent paid-for-list.
+    paid_list: Arc<PaidList>,
+    /// Payment verifier for `PoP` validation.
+    payment_verifier: Arc<PaymentVerifier>,
+    /// Replication pipeline queues.
+    queues: Arc<RwLock<ReplicationQueues>>,
+    /// Neighbor sync cycle state.
+    sync_state: Arc<RwLock<NeighborSyncState>>,
+    /// Per-peer sync history (for `RepairOpportunity`).
+    sync_history: Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    /// Bootstrap state tracking.
+    bootstrap_state: Arc<RwLock<BootstrapState>>,
+    /// Whether this node is currently bootstrapping.
+    is_bootstrapping: Arc<RwLock<bool>>,
+    /// Shutdown token.
+    shutdown: CancellationToken,
+    /// Background task handles.
+    task_handles: Vec<JoinHandle<()>>,
+}
+
+impl ReplicationEngine {
+    /// Create a new replication engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `PaidList` LMDB environment cannot be opened
+    /// or if the configuration fails validation.
+    pub async fn new(
+        config: ReplicationConfig,
+        p2p_node: Arc<P2PNode>,
+        storage: Arc<LmdbStorage>,
+        payment_verifier: Arc<PaymentVerifier>,
+        root_dir: &Path,
+        shutdown: CancellationToken,
+    ) -> Result<Self> {
+        config.validate().map_err(Error::Config)?;
+
+        let paid_list = Arc::new(
+            PaidList::new(root_dir)
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to open PaidList: {e}")))?,
+        );
+
+        let initial_neighbors = NeighborSyncState::new_cycle(Vec::new());
+        let config = Arc::new(config);
+
+        Ok(Self {
+            config: Arc::clone(&config),
+            p2p_node,
+            storage,
+            paid_list,
+            payment_verifier,
+            queues: Arc::new(RwLock::new(ReplicationQueues::new(
+                config.max_parallel_fetch_bootstrap,
+            ))),
+            sync_state: Arc::new(RwLock::new(initial_neighbors)),
+            sync_history: Arc::new(RwLock::new(HashMap::new())),
+            bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
+            is_bootstrapping: Arc::new(RwLock::new(true)),
+            shutdown,
+            task_handles: Vec::new(),
+        })
+    }
+
+    /// Get a reference to the `PaidList`.
+    #[must_use]
+    pub fn paid_list(&self) -> &Arc<PaidList> {
+        &self.paid_list
+    }
+
+    /// Start all background tasks.
+    pub fn start(&mut self) {
+        info!("Starting replication engine");
+
+        self.start_message_handler();
+        self.start_neighbor_sync_loop();
+        self.start_self_lookup_loop();
+        self.start_audit_loop();
+        self.start_fetch_worker();
+        self.start_verification_worker();
+        self.start_bootstrap_sync();
+
+        info!(
+            "Replication engine started with {} background tasks",
+            self.task_handles.len()
+        );
+    }
+
+    /// Execute fresh replication for a newly stored record.
+    pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
+        fresh::replicate_fresh(
+            key,
+            data,
+            proof_of_payment,
+            &self.p2p_node,
+            &self.paid_list,
+            &self.config,
+        )
+        .await;
+    }
+
+    // =======================================================================
+    // Background task launchers
+    // =======================================================================
+
+    fn start_message_handler(&mut self) {
+        let mut events = self.p2p_node.subscribe_events();
+        let p2p = Arc::clone(&self.p2p_node);
+        let storage = Arc::clone(&self.storage);
+        let paid_list = Arc::clone(&self.paid_list);
+        let payment_verifier = Arc::clone(&self.payment_verifier);
+        let queues = Arc::clone(&self.queues);
+        let config = Arc::clone(&self.config);
+        let shutdown = self.shutdown.clone();
+        let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let sync_state = Arc::clone(&self.sync_state);
+        let sync_history = Arc::clone(&self.sync_history);
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    event = events.recv() => {
+                        let Ok(event) = event else { continue };
+                        match event {
+                            P2PEvent::Message {
+                                topic,
+                                source: Some(source),
+                                data,
+                            } => {
+                                if topic == REPLICATION_PROTOCOL_ID {
+                                    if let Err(e) = handle_replication_message(
+                                        &source,
+                                        &data,
+                                        &p2p,
+                                        &storage,
+                                        &paid_list,
+                                        &payment_verifier,
+                                        &queues,
+                                        &config,
+                                        &is_bootstrapping,
+                                        &sync_state,
+                                        &sync_history,
+                                    ).await {
+                                        debug!(
+                                            "Replication message from {source} error: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            // Gap 4: Topology churn handling (Section 13).
+                            P2PEvent::PeerConnected(peer_id, _addr) => {
+                                let kind = classify_topology_event(
+                                    &peer_id, &p2p, &config,
+                                ).await;
+                                if kind == TopologyEventKind::Trigger {
+                                    debug!(
+                                        "Close-group churn detected (connected {peer_id}), \
+                                         triggering early neighbor sync"
+                                    );
+                                    run_neighbor_sync_round(
+                                        &p2p,
+                                        &storage,
+                                        &paid_list,
+                                        &queues,
+                                        &config,
+                                        &sync_state,
+                                        &sync_history,
+                                        &is_bootstrapping,
+                                        &bootstrap_state,
+                                    ).await;
+                                }
+                            }
+                            P2PEvent::PeerDisconnected(peer_id) => {
+                                let kind = classify_topology_event(
+                                    &peer_id, &p2p, &config,
+                                ).await;
+                                if kind == TopologyEventKind::Trigger {
+                                    debug!(
+                                        "Close-group churn detected (disconnected {peer_id}), \
+                                         triggering early neighbor sync"
+                                    );
+                                    run_neighbor_sync_round(
+                                        &p2p,
+                                        &storage,
+                                        &paid_list,
+                                        &queues,
+                                        &config,
+                                        &sync_state,
+                                        &sync_history,
+                                        &is_bootstrapping,
+                                        &bootstrap_state,
+                                    ).await;
+                                }
+                            }
+                            P2PEvent::Message { .. } => {}
+                        }
+                    }
+                }
+            }
+            debug!("Replication message handler shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    fn start_neighbor_sync_loop(&mut self) {
+        let p2p = Arc::clone(&self.p2p_node);
+        let storage = Arc::clone(&self.storage);
+        let paid_list = Arc::clone(&self.paid_list);
+        let queues = Arc::clone(&self.queues);
+        let config = Arc::clone(&self.config);
+        let shutdown = self.shutdown.clone();
+        let sync_state = Arc::clone(&self.sync_state);
+        let sync_history = Arc::clone(&self.sync_history);
+        let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let interval = config.random_neighbor_sync_interval();
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {
+                        run_neighbor_sync_round(
+                            &p2p,
+                            &storage,
+                            &paid_list,
+                            &queues,
+                            &config,
+                            &sync_state,
+                            &sync_history,
+                            &is_bootstrapping,
+                            &bootstrap_state,
+                        ).await;
+                    }
+                }
+            }
+            debug!("Neighbor sync loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    fn start_self_lookup_loop(&mut self) {
+        let p2p = Arc::clone(&self.p2p_node);
+        let config = Arc::clone(&self.config);
+        let shutdown = self.shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let interval = config.random_self_lookup_interval();
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {
+                        if let Err(e) = p2p.dht_manager().trigger_self_lookup().await {
+                            debug!("Self-lookup failed: {e}");
+                        }
+                    }
+                }
+            }
+            debug!("Self-lookup loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    fn start_audit_loop(&mut self) {
+        let p2p = Arc::clone(&self.p2p_node);
+        let storage = Arc::clone(&self.storage);
+        let config = Arc::clone(&self.config);
+        let shutdown = self.shutdown.clone();
+        let sync_history = Arc::clone(&self.sync_history);
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let sync_state = Arc::clone(&self.sync_state);
+
+        let handle = tokio::spawn(async move {
+            // Invariant 19: wait for bootstrap to drain before starting audits.
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(
+                        std::time::Duration::from_secs(BOOTSTRAP_DRAIN_CHECK_SECS)
+                    ) => {
+                        if bootstrap_state.read().await.is_drained() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Run one audit tick immediately after bootstrap drain.
+            {
+                let result = {
+                    let history = sync_history.read().await;
+                    let claims = sync_state.read().await;
+                    audit::audit_tick(&p2p, &storage, &config, &history, &claims.bootstrap_claims)
+                        .await
+                };
+                handle_audit_result(&result, &p2p, &sync_state, &config).await;
+            }
+
+            // Then run periodically.
+            loop {
+                let interval = config.random_audit_tick_interval();
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {
+                        let result = {
+                            let history = sync_history.read().await;
+                            let claims = sync_state.read().await;
+                            audit::audit_tick(
+                                &p2p, &storage, &config, &history,
+                                &claims.bootstrap_claims,
+                            )
+                            .await
+                        };
+                        handle_audit_result(&result, &p2p, &sync_state, &config).await;
+                    }
+                }
+            }
+            debug!("Audit loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    fn start_fetch_worker(&mut self) {
+        let p2p = Arc::clone(&self.p2p_node);
+        let storage = Arc::clone(&self.storage);
+        let queues = Arc::clone(&self.queues);
+        let config = Arc::clone(&self.config);
+        let shutdown = self.shutdown.clone();
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                // Gap 7: Adaptive fetch concurrency.
+                // Poll immediately when there is backlog, sleep when idle.
+                let has_backlog = {
+                    let q = queues.read().await;
+                    q.fetch_queue_count() > 0
+                };
+
+                if has_backlog {
+                    // Process immediately when work is available.
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
+                    run_fetch_cycle(&p2p, &storage, &queues, &config).await;
+                } else {
+                    tokio::select! {
+                        () = shutdown.cancelled() => break,
+                        () = tokio::time::sleep(
+                            std::time::Duration::from_millis(FETCH_WORKER_POLL_MS)
+                        ) => {
+                            run_fetch_cycle(&p2p, &storage, &queues, &config).await;
+                        }
+                    }
+                }
+
+                // Gap 8: Post-bootstrap concurrency adjustment.
+                if bootstrap_state.read().await.is_drained() {
+                    let mut q = queues.write().await;
+                    q.set_max_concurrent_fetch(MAX_PARALLEL_FETCH_NORMAL);
+                }
+            }
+            debug!("Fetch worker shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    fn start_verification_worker(&mut self) {
+        let p2p = Arc::clone(&self.p2p_node);
+        let queues = Arc::clone(&self.queues);
+        let paid_list = Arc::clone(&self.paid_list);
+        let config = Arc::clone(&self.config);
+        let shutdown = self.shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(
+                        std::time::Duration::from_millis(VERIFICATION_WORKER_POLL_MS)
+                    ) => {
+                        run_verification_cycle(&p2p, &paid_list, &queues, &config).await;
+                    }
+                }
+            }
+            debug!("Verification worker shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// Gap 3: Run a one-shot bootstrap sync on startup.
+    ///
+    /// Finds close neighbors, syncs with each in round-robin batches,
+    /// admits returned hints into the verification pipeline, and tracks
+    /// discovered keys for bootstrap drain detection.
+    fn start_bootstrap_sync(&mut self) {
+        let p2p = Arc::clone(&self.p2p_node);
+        let storage = Arc::clone(&self.storage);
+        let paid_list = Arc::clone(&self.paid_list);
+        let queues = Arc::clone(&self.queues);
+        let config = Arc::clone(&self.config);
+        let shutdown = self.shutdown.clone();
+        let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+
+        let handle = tokio::spawn(async move {
+            let self_id = *p2p.peer_id();
+            let neighbors =
+                bootstrap::snapshot_close_neighbors(&p2p, &self_id, config.neighbor_sync_scope)
+                    .await;
+
+            if neighbors.is_empty() {
+                info!("Bootstrap sync: no close neighbors found, marking drained");
+                bootstrap::mark_bootstrap_drained(&bootstrap_state).await;
+                return;
+            }
+
+            let neighbor_count = neighbors.len();
+            info!("Bootstrap sync: syncing with {neighbor_count} close neighbors");
+            bootstrap::increment_pending_requests(&bootstrap_state, neighbor_count).await;
+
+            let bootstrapping = *is_bootstrapping.read().await;
+
+            // Process neighbors in batches of NEIGHBOR_SYNC_PEER_COUNT.
+            for batch in neighbors.chunks(config.neighbor_sync_peer_count) {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+
+                for peer in batch {
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
+
+                    let response = neighbor_sync::sync_with_peer(
+                        peer,
+                        &p2p,
+                        &storage,
+                        &paid_list,
+                        &config,
+                        bootstrapping,
+                    )
+                    .await;
+
+                    bootstrap::decrement_pending_requests(&bootstrap_state, 1).await;
+
+                    if let Some(resp) = response {
+                        if !resp.bootstrapping {
+                            // Admit hints into verification pipeline.
+                            let admitted_keys = admit_bootstrap_hints(
+                                &self_id,
+                                peer,
+                                &resp.replica_hints,
+                                &resp.paid_hints,
+                                &p2p,
+                                &config,
+                                &storage,
+                                &paid_list,
+                                &queues,
+                            )
+                            .await;
+
+                            // Track discovered keys for drain detection.
+                            if !admitted_keys.is_empty() {
+                                bootstrap::track_discovered_keys(&bootstrap_state, &admitted_keys)
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check drain condition.
+            {
+                let q = queues.read().await;
+                bootstrap::check_bootstrap_drained(&bootstrap_state, &q).await;
+            }
+
+            info!("Bootstrap sync completed");
+        });
+        self.task_handles.push(handle);
+    }
+}
+
+// ===========================================================================
+// Free functions for background tasks
+// ===========================================================================
+
+/// Handle an incoming replication protocol message.
+#[allow(clippy::too_many_arguments)]
+async fn handle_replication_message(
+    source: &PeerId,
+    data: &[u8],
+    p2p_node: &Arc<P2PNode>,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    payment_verifier: &Arc<PaymentVerifier>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    config: &ReplicationConfig,
+    is_bootstrapping: &Arc<RwLock<bool>>,
+    sync_state: &Arc<RwLock<NeighborSyncState>>,
+    sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+) -> Result<()> {
+    let msg = ReplicationMessage::decode(data)
+        .map_err(|e| Error::Protocol(format!("Failed to decode replication message: {e}")))?;
+
+    match msg.body {
+        ReplicationMessageBody::FreshReplicationOffer(ref offer) => {
+            handle_fresh_offer(
+                source,
+                offer,
+                storage,
+                paid_list,
+                payment_verifier,
+                p2p_node,
+                config,
+                msg.request_id,
+            )
+            .await
+        }
+        ReplicationMessageBody::PaidNotify(ref notify) => {
+            handle_paid_notify(
+                source,
+                notify,
+                paid_list,
+                payment_verifier,
+                p2p_node,
+                config,
+            )
+            .await
+        }
+        ReplicationMessageBody::NeighborSyncRequest(ref request) => {
+            let bootstrapping = *is_bootstrapping.read().await;
+            handle_neighbor_sync_request(
+                source,
+                request,
+                p2p_node,
+                storage,
+                paid_list,
+                queues,
+                config,
+                bootstrapping,
+                sync_state,
+                sync_history,
+                msg.request_id,
+            )
+            .await
+        }
+        ReplicationMessageBody::VerificationRequest(ref request) => {
+            handle_verification_request(
+                source,
+                request,
+                storage,
+                paid_list,
+                p2p_node,
+                msg.request_id,
+            )
+            .await
+        }
+        ReplicationMessageBody::FetchRequest(ref request) => {
+            handle_fetch_request(source, request, storage, p2p_node, msg.request_id).await
+        }
+        ReplicationMessageBody::AuditChallenge(ref challenge) => {
+            let bootstrapping = *is_bootstrapping.read().await;
+            handle_audit_challenge_msg(
+                source,
+                challenge,
+                storage,
+                p2p_node,
+                bootstrapping,
+                msg.request_id,
+            )
+            .await
+        }
+        // Response messages are handled by their respective request initiators.
+        ReplicationMessageBody::FreshReplicationResponse(_)
+        | ReplicationMessageBody::NeighborSyncResponse(_)
+        | ReplicationMessageBody::VerificationResponse(_)
+        | ReplicationMessageBody::FetchResponse(_)
+        | ReplicationMessageBody::AuditResponse(_) => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-message-type handlers
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn handle_fresh_offer(
+    source: &PeerId,
+    offer: &protocol::FreshReplicationOffer,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    payment_verifier: &Arc<PaymentVerifier>,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+    request_id: u64,
+) -> Result<()> {
+    let self_id = *p2p_node.peer_id();
+
+    // Rule 5: reject if PoP is missing.
+    if offer.proof_of_payment.is_empty() {
+        send_replication_response(
+            source,
+            p2p_node,
+            request_id,
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+                key: offer.key,
+                reason: "Missing proof of payment".to_string(),
+            }),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Rule 7: check responsibility.
+    if !admission::is_responsible(&self_id, &offer.key, p2p_node, config.close_group_size).await {
+        send_replication_response(
+            source,
+            p2p_node,
+            request_id,
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+                key: offer.key,
+                reason: "Not responsible for this key".to_string(),
+            }),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Gap 1: Validate PoP via PaymentVerifier.
+    match payment_verifier
+        .verify_payment(&offer.key, Some(&offer.proof_of_payment))
+        .await
+    {
+        Ok(status) if status.can_store() => {
+            debug!(
+                "PoP validated for fresh offer key {}",
+                hex::encode(offer.key)
+            );
+        }
+        Ok(_) => {
+            send_replication_response(
+                source,
+                p2p_node,
+                request_id,
+                ReplicationMessageBody::FreshReplicationResponse(
+                    FreshReplicationResponse::Rejected {
+                        key: offer.key,
+                        reason: "Payment verification failed: payment required".to_string(),
+                    },
+                ),
+            )
+            .await;
+            return Ok(());
+        }
+        Err(e) => {
+            warn!(
+                "PoP verification error for key {}: {e}",
+                hex::encode(offer.key)
+            );
+            send_replication_response(
+                source,
+                p2p_node,
+                request_id,
+                ReplicationMessageBody::FreshReplicationResponse(
+                    FreshReplicationResponse::Rejected {
+                        key: offer.key,
+                        reason: format!("Payment verification error: {e}"),
+                    },
+                ),
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
+    // Rule 6: add to PaidForList.
+    if let Err(e) = paid_list.insert(&offer.key).await {
+        warn!("Failed to add key to PaidForList: {e}");
+    }
+
+    // Store the record.
+    match storage.put(&offer.key, &offer.data).await {
+        Ok(_) => {
+            send_replication_response(
+                source,
+                p2p_node,
+                request_id,
+                ReplicationMessageBody::FreshReplicationResponse(
+                    FreshReplicationResponse::Accepted { key: offer.key },
+                ),
+            )
+            .await;
+        }
+        Err(e) => {
+            send_replication_response(
+                source,
+                p2p_node,
+                request_id,
+                ReplicationMessageBody::FreshReplicationResponse(
+                    FreshReplicationResponse::Rejected {
+                        key: offer.key,
+                        reason: format!("Storage error: {e}"),
+                    },
+                ),
+            )
+            .await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_paid_notify(
+    _source: &PeerId,
+    notify: &protocol::PaidNotify,
+    paid_list: &Arc<PaidList>,
+    payment_verifier: &Arc<PaymentVerifier>,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+) -> Result<()> {
+    let self_id = *p2p_node.peer_id();
+
+    // Rule 3: validate PoP presence before adding.
+    if notify.proof_of_payment.is_empty() {
+        return Ok(());
+    }
+
+    // Check if we're in PaidCloseGroup for this key.
+    if !admission::is_in_paid_close_group(
+        &self_id,
+        &notify.key,
+        p2p_node,
+        config.paid_list_close_group_size,
+    )
+    .await
+    {
+        return Ok(());
+    }
+
+    // Gap 1: Validate PoP via PaymentVerifier.
+    match payment_verifier
+        .verify_payment(&notify.key, Some(&notify.proof_of_payment))
+        .await
+    {
+        Ok(status) if status.can_store() => {
+            debug!(
+                "PoP validated for paid notify key {}",
+                hex::encode(notify.key)
+            );
+        }
+        Ok(_) => {
+            warn!(
+                "Paid notify rejected: payment required for key {}",
+                hex::encode(notify.key)
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            warn!(
+                "PoP verification error for paid notify key {}: {e}",
+                hex::encode(notify.key)
+            );
+            return Ok(());
+        }
+    }
+
+    if let Err(e) = paid_list.insert(&notify.key).await {
+        warn!("Failed to add paid notify key to PaidForList: {e}");
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_neighbor_sync_request(
+    source: &PeerId,
+    request: &protocol::NeighborSyncRequest,
+    p2p_node: &Arc<P2PNode>,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    config: &ReplicationConfig,
+    is_bootstrapping: bool,
+    _sync_state: &Arc<RwLock<NeighborSyncState>>,
+    sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    request_id: u64,
+) -> Result<()> {
+    let self_id = *p2p_node.peer_id();
+
+    // Build response (outbound hints).
+    let (response, sender_in_rt) = neighbor_sync::handle_sync_request(
+        source,
+        request,
+        p2p_node,
+        storage,
+        paid_list,
+        config,
+        is_bootstrapping,
+    )
+    .await;
+
+    // Send response.
+    send_replication_response(
+        source,
+        p2p_node,
+        request_id,
+        ReplicationMessageBody::NeighborSyncResponse(response),
+    )
+    .await;
+
+    // Process inbound hints only if sender is in LocalRT (Rule 4-6).
+    if !sender_in_rt {
+        return Ok(());
+    }
+
+    // Update sync history for this peer.
+    {
+        let mut history = sync_history.write().await;
+        let record = history.entry(*source).or_insert(PeerSyncRecord {
+            last_sync: None,
+            cycles_since_sync: 0,
+        });
+        record.last_sync = Some(Instant::now());
+        record.cycles_since_sync = 0;
+    }
+
+    // Admit inbound hints.
+    let pending_keys: HashSet<XorName> = {
+        let q = queues.read().await;
+        q.pending_keys().into_iter().collect()
+    };
+
+    let admitted = admission::admit_hints(
+        &self_id,
+        &request.replica_hints,
+        &request.paid_hints,
+        p2p_node,
+        config,
+        storage,
+        paid_list,
+        &pending_keys,
+    )
+    .await;
+
+    // Queue admitted keys for verification.
+    let mut q = queues.write().await;
+    let now = Instant::now();
+
+    for key in admitted.replica_keys {
+        if !storage.exists(&key).unwrap_or(false) {
+            q.add_pending_verify(
+                key,
+                VerificationEntry {
+                    state: VerificationState::PendingVerify,
+                    pipeline: HintPipeline::Replica,
+                    verified_sources: Vec::new(),
+                    tried_sources: HashSet::new(),
+                    created_at: now,
+                    hint_sender: *source,
+                },
+            );
+        }
+    }
+
+    for key in admitted.paid_only_keys {
+        q.add_pending_verify(
+            key,
+            VerificationEntry {
+                state: VerificationState::PendingVerify,
+                pipeline: HintPipeline::PaidOnly,
+                verified_sources: Vec::new(),
+                tried_sources: HashSet::new(),
+                created_at: now,
+                hint_sender: *source,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+async fn handle_verification_request(
+    source: &PeerId,
+    request: &protocol::VerificationRequest,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    p2p_node: &Arc<P2PNode>,
+    request_id: u64,
+) -> Result<()> {
+    let paid_check_set: HashSet<u16> = request.paid_list_check_indices.iter().copied().collect();
+
+    let mut results = Vec::with_capacity(request.keys.len());
+    for (i, key) in request.keys.iter().enumerate() {
+        let present = storage.exists(key).unwrap_or(false);
+        let paid = if paid_check_set.contains(&u16::try_from(i).unwrap_or(u16::MAX)) {
+            Some(paid_list.contains(key).unwrap_or(false))
+        } else {
+            None
+        };
+        results.push(protocol::KeyVerificationResult {
+            key: *key,
+            present,
+            paid,
+        });
+    }
+
+    send_replication_response(
+        source,
+        p2p_node,
+        request_id,
+        ReplicationMessageBody::VerificationResponse(VerificationResponse { results }),
+    )
+    .await;
+
+    Ok(())
+}
+
+async fn handle_fetch_request(
+    source: &PeerId,
+    request: &protocol::FetchRequest,
+    storage: &Arc<LmdbStorage>,
+    p2p_node: &Arc<P2PNode>,
+    request_id: u64,
+) -> Result<()> {
+    let response = match storage.get(&request.key).await {
+        Ok(Some(data)) => protocol::FetchResponse::Success {
+            key: request.key,
+            data,
+        },
+        Ok(None) => protocol::FetchResponse::NotFound { key: request.key },
+        Err(e) => protocol::FetchResponse::Error {
+            key: request.key,
+            reason: format!("{e}"),
+        },
+    };
+
+    send_replication_response(
+        source,
+        p2p_node,
+        request_id,
+        ReplicationMessageBody::FetchResponse(response),
+    )
+    .await;
+
+    Ok(())
+}
+
+async fn handle_audit_challenge_msg(
+    source: &PeerId,
+    challenge: &protocol::AuditChallenge,
+    storage: &Arc<LmdbStorage>,
+    p2p_node: &Arc<P2PNode>,
+    is_bootstrapping: bool,
+    request_id: u64,
+) -> Result<()> {
+    let response = audit::handle_audit_challenge(challenge, storage, is_bootstrapping);
+
+    send_replication_response(
+        source,
+        p2p_node,
+        request_id,
+        ReplicationMessageBody::AuditResponse(response),
+    )
+    .await;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Message sending helper
+// ---------------------------------------------------------------------------
+
+/// Send a replication response message. Fire-and-forget: logs errors but
+/// does not propagate them.
+async fn send_replication_response(
+    peer: &PeerId,
+    p2p_node: &Arc<P2PNode>,
+    request_id: u64,
+    body: ReplicationMessageBody,
+) {
+    let msg = ReplicationMessage { request_id, body };
+    let encoded = match msg.encode() {
+        Ok(data) => data,
+        Err(e) => {
+            warn!("Failed to encode replication response: {e}");
+            return;
+        }
+    };
+    if let Err(e) = p2p_node
+        .send_message(peer, REPLICATION_PROTOCOL_ID, encoded, &[])
+        .await
+    {
+        debug!("Failed to send replication response to {peer}: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Neighbor sync round
+// ---------------------------------------------------------------------------
+
+/// Run one neighbor sync round.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_neighbor_sync_round(
+    p2p_node: &Arc<P2PNode>,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    config: &ReplicationConfig,
+    sync_state: &Arc<RwLock<NeighborSyncState>>,
+    sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    is_bootstrapping: &Arc<RwLock<bool>>,
+    _bootstrap_state: &Arc<RwLock<BootstrapState>>,
+) {
+    let self_id = *p2p_node.peer_id();
+    let bootstrapping = *is_bootstrapping.read().await;
+
+    // Check if cycle is complete; start new one if needed.
+    {
+        let mut state = sync_state.write().await;
+        if state.is_cycle_complete() {
+            // Post-cycle pruning (Section 11).
+            pruning::run_prune_pass(&self_id, storage, paid_list, p2p_node, config).await;
+
+            // Increment `cycles_since_sync` for all peers.
+            {
+                let mut history = sync_history.write().await;
+                for record in history.values_mut() {
+                    record.cycles_since_sync = record.cycles_since_sync.saturating_add(1);
+                }
+            }
+
+            // Take fresh close-neighbor snapshot.
+            let neighbors = neighbor_sync::snapshot_close_neighbors(
+                p2p_node,
+                &self_id,
+                config.neighbor_sync_scope,
+            )
+            .await;
+
+            // Preserve last_sync_times across cycles.
+            let old_sync_times = std::mem::take(&mut state.last_sync_times);
+            *state = NeighborSyncState::new_cycle(neighbors);
+            state.last_sync_times = old_sync_times;
+        }
+    }
+
+    // Select batch of peers.
+    let batch = {
+        let mut state = sync_state.write().await;
+        neighbor_sync::select_sync_batch(
+            &mut state,
+            config.neighbor_sync_peer_count,
+            config.neighbor_sync_cooldown,
+        )
+    };
+
+    if batch.is_empty() {
+        return;
+    }
+
+    debug!("Neighbor sync: syncing with {} peers", batch.len());
+
+    // Sync with each peer in the batch.
+    for peer in &batch {
+        let response = neighbor_sync::sync_with_peer(
+            peer,
+            p2p_node,
+            storage,
+            paid_list,
+            config,
+            bootstrapping,
+        )
+        .await;
+
+        if let Some(resp) = response {
+            // Record successful sync.
+            {
+                let mut state = sync_state.write().await;
+                neighbor_sync::record_successful_sync(&mut state, peer);
+            }
+            {
+                let mut history = sync_history.write().await;
+                let record = history.entry(*peer).or_insert(PeerSyncRecord {
+                    last_sync: None,
+                    cycles_since_sync: 0,
+                });
+                record.last_sync = Some(Instant::now());
+                record.cycles_since_sync = 0;
+            }
+
+            // Process inbound hints from response (skip if peer is bootstrapping).
+            if resp.bootstrapping {
+                // Gap 6: BootstrapClaimAbuse grace period enforcement.
+                let now = Instant::now();
+                let mut state = sync_state.write().await;
+                let first_seen = state.bootstrap_claims.entry(*peer).or_insert(now);
+                let claim_age = now.duration_since(*first_seen);
+                if claim_age > config.bootstrap_claim_grace_period {
+                    warn!(
+                        "Peer {peer} has been claiming bootstrap for {:?}, \
+                         exceeding grace period of {:?} — reporting abuse",
+                        claim_age, config.bootstrap_claim_grace_period,
+                    );
+                    p2p_node
+                        .report_trust_event(
+                            peer,
+                            TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                        )
+                        .await;
+                }
+            } else {
+                // Peer is not claiming bootstrap; clear any prior claim.
+                {
+                    let mut state = sync_state.write().await;
+                    state.bootstrap_claims.remove(peer);
+                }
+                admit_response_hints(
+                    &self_id,
+                    peer,
+                    &resp.replica_hints,
+                    &resp.paid_hints,
+                    p2p_node,
+                    config,
+                    storage,
+                    paid_list,
+                    queues,
+                )
+                .await;
+            }
+        } else {
+            // Sync failed -- remove peer and try to fill slot.
+            let mut state = sync_state.write().await;
+            let _replacement = neighbor_sync::handle_sync_failure(&mut state, peer);
+        }
+    }
+}
+
+/// Admit hints from a neighbor sync response into the verification pipeline.
+#[allow(clippy::too_many_arguments)]
+async fn admit_response_hints(
+    self_id: &PeerId,
+    source_peer: &PeerId,
+    replica_hints: &[XorName],
+    paid_hints: &[XorName],
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+) {
+    let pending_keys: HashSet<XorName> = {
+        let q = queues.read().await;
+        q.pending_keys().into_iter().collect()
+    };
+
+    let admitted = admission::admit_hints(
+        self_id,
+        replica_hints,
+        paid_hints,
+        p2p_node,
+        config,
+        storage,
+        paid_list,
+        &pending_keys,
+    )
+    .await;
+
+    let mut q = queues.write().await;
+    let now = Instant::now();
+
+    for key in admitted.replica_keys {
+        if !storage.exists(&key).unwrap_or(false) {
+            q.add_pending_verify(
+                key,
+                VerificationEntry {
+                    state: VerificationState::PendingVerify,
+                    pipeline: HintPipeline::Replica,
+                    verified_sources: Vec::new(),
+                    tried_sources: HashSet::new(),
+                    created_at: now,
+                    hint_sender: *source_peer,
+                },
+            );
+        }
+    }
+
+    for key in admitted.paid_only_keys {
+        q.add_pending_verify(
+            key,
+            VerificationEntry {
+                state: VerificationState::PendingVerify,
+                pipeline: HintPipeline::PaidOnly,
+                verified_sources: Vec::new(),
+                tried_sources: HashSet::new(),
+                created_at: now,
+                hint_sender: *source_peer,
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verification cycle
+// ---------------------------------------------------------------------------
+
+/// Run one verification cycle: process pending keys through quorum checks.
+async fn run_verification_cycle(
+    p2p_node: &Arc<P2PNode>,
+    paid_list: &Arc<PaidList>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    config: &ReplicationConfig,
+) {
+    let pending_keys = {
+        let q = queues.read().await;
+        q.pending_keys()
+    };
+
+    if pending_keys.is_empty() {
+        return;
+    }
+
+    let self_id = *p2p_node.peer_id();
+
+    // Step 1: Check local PaidForList for fast-path authorization (Section 9,
+    // step 4).
+    let mut keys_needing_network = Vec::new();
+    {
+        let mut q = queues.write().await;
+        for key in &pending_keys {
+            if paid_list.contains(key).unwrap_or(false) {
+                if let Some(entry) = q.get_pending_mut(key) {
+                    entry.state = VerificationState::PaidListVerified;
+                    if entry.pipeline == HintPipeline::PaidOnly {
+                        // Paid-only pipeline: PaidForList already updated, done.
+                        q.remove_pending(key);
+                        continue;
+                    }
+                }
+            }
+            // Both branches (paid locally or not) need network verification.
+            keys_needing_network.push(*key);
+        }
+    }
+
+    if keys_needing_network.is_empty() {
+        return;
+    }
+
+    // Step 2: Compute targets and run network verification round.
+    let targets =
+        quorum::compute_verification_targets(&keys_needing_network, p2p_node, config, &self_id)
+            .await;
+
+    let evidence =
+        quorum::run_verification_round(&keys_needing_network, &targets, p2p_node, config).await;
+
+    // Step 3: Evaluate results and update queues.
+    let mut q = queues.write().await;
+    for key in &keys_needing_network {
+        let Some(ev) = evidence.get(key) else {
+            continue;
+        };
+
+        let entry = match q.get_pending(key) {
+            Some(e) => e.clone(),
+            None => continue,
+        };
+
+        let outcome = quorum::evaluate_key_evidence(key, ev, &targets, config);
+
+        match outcome {
+            KeyVerificationOutcome::QuorumVerified { sources } => {
+                // Derived authorization: add to PaidForList.
+                if let Err(e) = paid_list.insert(key).await {
+                    warn!("Failed to add quorum-verified key to PaidForList: {e}");
+                }
+                if entry.pipeline == HintPipeline::Replica && !sources.is_empty() {
+                    let distance = crate::client::xor_distance(key, p2p_node.peer_id().as_bytes());
+                    q.remove_pending(key);
+                    q.enqueue_fetch(*key, distance, sources);
+                } else {
+                    q.remove_pending(key);
+                }
+            }
+            KeyVerificationOutcome::PaidListVerified { sources } => {
+                if let Err(e) = paid_list.insert(key).await {
+                    warn!("Failed to add paid-verified key to PaidForList: {e}");
+                }
+                if entry.pipeline == HintPipeline::Replica && !sources.is_empty() {
+                    let distance = crate::client::xor_distance(key, p2p_node.peer_id().as_bytes());
+                    q.remove_pending(key);
+                    q.enqueue_fetch(*key, distance, sources);
+                } else if entry.pipeline == HintPipeline::Replica {
+                    warn!(
+                        "Paid-authorized key {} has no holders (possible data loss)",
+                        hex::encode(key)
+                    );
+                    q.remove_pending(key);
+                } else {
+                    // Paid-only pipeline complete.
+                    q.remove_pending(key);
+                }
+            }
+            KeyVerificationOutcome::QuorumFailed | KeyVerificationOutcome::QuorumInconclusive => {
+                q.remove_pending(key);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fetch cycle
+// ---------------------------------------------------------------------------
+
+/// Run one fetch cycle: dequeue and execute fetches.
+#[allow(clippy::too_many_lines)]
+async fn run_fetch_cycle(
+    p2p_node: &Arc<P2PNode>,
+    storage: &Arc<LmdbStorage>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    config: &ReplicationConfig,
+) {
+    loop {
+        let candidate = {
+            let mut q = queues.write().await;
+            q.dequeue_fetch()
+        };
+
+        let Some(candidate) = candidate else { break };
+
+        // Pick first untried source.
+        let source = match candidate
+            .sources
+            .iter()
+            .find(|p| !candidate.tried.contains(p))
+        {
+            Some(p) => *p,
+            None => continue,
+        };
+
+        // Mark as in-flight.
+        {
+            let mut q = queues.write().await;
+            q.start_fetch(candidate.key, source, candidate.sources.clone());
+        }
+
+        // Build and send fetch request.
+        let request = protocol::FetchRequest { key: candidate.key };
+        let msg = ReplicationMessage {
+            request_id: rand::thread_rng().gen::<u64>(),
+            body: ReplicationMessageBody::FetchRequest(request),
+        };
+
+        let encoded = match msg.encode() {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("Failed to encode fetch request: {e}");
+                let mut q = queues.write().await;
+                q.complete_fetch(&candidate.key);
+                continue;
+            }
+        };
+
+        let result = p2p_node
+            .send_request(
+                &source,
+                REPLICATION_PROTOCOL_ID,
+                encoded,
+                config.fetch_request_timeout,
+            )
+            .await;
+
+        match result {
+            Ok(response) => {
+                if let Ok(resp_msg) = ReplicationMessage::decode(&response.data) {
+                    if let ReplicationMessageBody::FetchResponse(
+                        protocol::FetchResponse::Success { key, data },
+                    ) = resp_msg.body
+                    {
+                        // Gap 2: Content-address integrity check.
+                        let computed = crate::client::compute_address(&data);
+                        if computed != key {
+                            warn!(
+                                "Fetched record integrity check failed: expected {}, got {}",
+                                hex::encode(key),
+                                hex::encode(computed)
+                            );
+                            p2p_node
+                                .report_trust_event(
+                                    &source,
+                                    TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                                )
+                                .await;
+                            let mut q = queues.write().await;
+                            q.complete_fetch(&candidate.key);
+                            continue;
+                        }
+
+                        if let Err(e) = storage.put(&key, &data).await {
+                            warn!("Failed to store fetched record {}: {e}", hex::encode(key));
+                        }
+
+                        // Gap 5: Successful fetch — emit trust success for
+                        // source to mark prior fetch-failure evidence as
+                        // stale (Section 14, rule 4).
+                        p2p_node
+                            .report_trust_event(
+                                &source,
+                                TrustEvent::ApplicationSuccess(REPLICATION_TRUST_WEIGHT),
+                            )
+                            .await;
+
+                        let mut q = queues.write().await;
+                        q.complete_fetch(&candidate.key);
+                        continue;
+                    }
+                }
+                // Non-success response: emit trust failure and try next source.
+                // Gap 5: ReplicationFailure trust event.
+                p2p_node
+                    .report_trust_event(
+                        &source,
+                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                    )
+                    .await;
+                let mut q = queues.write().await;
+                if q.retry_fetch(&candidate.key).is_none() {
+                    q.complete_fetch(&candidate.key);
+                }
+            }
+            Err(e) => {
+                debug!("Fetch request to {source} failed: {e}");
+                // Gap 5: ReplicationFailure trust event on network error.
+                p2p_node
+                    .report_trust_event(
+                        &source,
+                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                    )
+                    .await;
+                let mut q = queues.write().await;
+                if q.retry_fetch(&candidate.key).is_none() {
+                    q.complete_fetch(&candidate.key);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit result handler
+// ---------------------------------------------------------------------------
+
+/// Handle audit result: log findings and emit trust events.
+async fn handle_audit_result(
+    result: &AuditTickResult,
+    p2p_node: &Arc<P2PNode>,
+    sync_state: &Arc<RwLock<NeighborSyncState>>,
+    config: &ReplicationConfig,
+) {
+    match result {
+        AuditTickResult::Passed {
+            challenged_peer,
+            keys_checked,
+        } => {
+            debug!("Audit passed for {challenged_peer} ({keys_checked} keys)");
+        }
+        AuditTickResult::Failed { evidence } => {
+            if let FailureEvidence::AuditFailure {
+                challenged_peer,
+                confirmed_failed_keys,
+                ..
+            } = evidence
+            {
+                error!(
+                    "Audit failure for {challenged_peer}: {} confirmed failed keys",
+                    confirmed_failed_keys.len()
+                );
+                p2p_node
+                    .report_trust_event(
+                        challenged_peer,
+                        TrustEvent::ApplicationFailure(config::MAX_CONSUMER_TRUST_WEIGHT),
+                    )
+                    .await;
+            }
+        }
+        AuditTickResult::BootstrapClaim { peer } => {
+            // Gap 6: BootstrapClaimAbuse grace period in audit path.
+            let now = Instant::now();
+            let mut state = sync_state.write().await;
+            let first_seen = state.bootstrap_claims.entry(*peer).or_insert(now);
+            let claim_age = now.duration_since(*first_seen);
+            if claim_age > config.bootstrap_claim_grace_period {
+                warn!(
+                    "Audit: peer {peer} claiming bootstrap past grace period \
+                     ({:?} > {:?}), reporting abuse",
+                    claim_age, config.bootstrap_claim_grace_period,
+                );
+                p2p_node
+                    .report_trust_event(
+                        peer,
+                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                    )
+                    .await;
+            } else {
+                debug!("Audit: peer {peer} claims bootstrapping (within grace period)");
+            }
+        }
+        AuditTickResult::Idle | AuditTickResult::InsufficientKeys => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Topology event classification (Gap 4 — Section 13)
+// ---------------------------------------------------------------------------
+
+/// Classify a topology event by checking if the peer is in our close
+/// neighborhood.
+async fn classify_topology_event(
+    peer: &PeerId,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+) -> TopologyEventKind {
+    let self_id = *p2p_node.peer_id();
+    let self_xor: XorName = *self_id.as_bytes();
+    let closest = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local(&self_xor, config.neighbor_sync_scope)
+        .await;
+
+    let in_close_group = closest.iter().any(|n| n.peer_id == *peer);
+    if in_close_group {
+        TopologyEventKind::Trigger
+    } else {
+        TopologyEventKind::Ignore
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap hint admission helper (Gap 3)
+// ---------------------------------------------------------------------------
+
+/// Admit hints from a bootstrap sync response into the verification pipeline
+/// and return the set of admitted keys for drain tracking.
+#[allow(clippy::too_many_arguments)]
+async fn admit_bootstrap_hints(
+    self_id: &PeerId,
+    source_peer: &PeerId,
+    replica_hints: &[XorName],
+    paid_hints: &[XorName],
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+) -> HashSet<XorName> {
+    let pending_keys: HashSet<XorName> = {
+        let q = queues.read().await;
+        q.pending_keys().into_iter().collect()
+    };
+
+    let admitted = admission::admit_hints(
+        self_id,
+        replica_hints,
+        paid_hints,
+        p2p_node,
+        config,
+        storage,
+        paid_list,
+        &pending_keys,
+    )
+    .await;
+
+    let mut discovered = HashSet::new();
+    let mut q = queues.write().await;
+    let now = Instant::now();
+
+    for key in admitted.replica_keys {
+        if !storage.exists(&key).unwrap_or(false) {
+            let added = q.add_pending_verify(
+                key,
+                VerificationEntry {
+                    state: VerificationState::PendingVerify,
+                    pipeline: HintPipeline::Replica,
+                    verified_sources: Vec::new(),
+                    tried_sources: HashSet::new(),
+                    created_at: now,
+                    hint_sender: *source_peer,
+                },
+            );
+            if added {
+                discovered.insert(key);
+            }
+        }
+    }
+
+    for key in admitted.paid_only_keys {
+        let added = q.add_pending_verify(
+            key,
+            VerificationEntry {
+                state: VerificationState::PendingVerify,
+                pipeline: HintPipeline::PaidOnly,
+                verified_sources: Vec::new(),
+                tried_sources: HashSet::new(),
+                created_at: now,
+                hint_sender: *source_peer,
+            },
+        );
+        if added {
+            discovered.insert(key);
+        }
+    }
+
+    discovered
+}

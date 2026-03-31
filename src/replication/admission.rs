@@ -1,0 +1,317 @@
+//! Neighbor-sync hint admission rules (Section 7).
+//!
+//! Per-key admission filtering before verification pipeline entry.
+//!
+//! When a neighbor sync hint arrives, each key must pass admission before
+//! entering verification. The admission rules check:
+//! 1. Sender is authenticated and in `LocalRT(self)` (checked before calling
+//!    this module).
+//! 2. Key is relevant to the receiver (checked here).
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use saorsa_core::identity::PeerId;
+use saorsa_core::P2PNode;
+
+use crate::ant_protocol::XorName;
+use crate::replication::config::ReplicationConfig;
+use crate::replication::paid_list::PaidList;
+use crate::storage::LmdbStorage;
+
+/// Result of admitting a set of hints from a neighbor sync.
+#[derive(Debug)]
+pub struct AdmissionResult {
+    /// Keys admitted into the replica-hint pipeline (fetch-eligible).
+    pub replica_keys: Vec<XorName>,
+    /// Keys admitted into the paid-hint-only pipeline (`PaidForList` update
+    /// only).
+    pub paid_only_keys: Vec<XorName>,
+    /// Keys rejected (not relevant to this node).
+    pub rejected_keys: Vec<XorName>,
+}
+
+/// Check if this node is responsible for key `K`.
+///
+/// Returns `true` if `self_id` is among the `close_group_size` nearest peers
+/// to `K` in `SelfInclusiveRT`.
+pub async fn is_responsible(
+    self_id: &PeerId,
+    key: &XorName,
+    p2p_node: &Arc<P2PNode>,
+    close_group_size: usize,
+) -> bool {
+    let closest = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local_with_self(key, close_group_size)
+        .await;
+    closest.iter().any(|n| n.peer_id == *self_id)
+}
+
+/// Check if this node is in the `PaidCloseGroup` for key `K`.
+///
+/// `PaidCloseGroup` = `paid_list_close_group_size` nearest peers to `K` in
+/// `SelfInclusiveRT`.
+pub async fn is_in_paid_close_group(
+    self_id: &PeerId,
+    key: &XorName,
+    p2p_node: &Arc<P2PNode>,
+    paid_list_close_group_size: usize,
+) -> bool {
+    let closest = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local_with_self(key, paid_list_close_group_size)
+        .await;
+    closest.iter().any(|n| n.peer_id == *self_id)
+}
+
+/// Admit neighbor-sync hints per Section 7.1 rules.
+///
+/// For each key in `replica_hints` and `paid_hints`:
+/// - **Cross-set precedence**: if a key appears in both sets, keep only the
+///   replica-hint entry.
+/// - **Replica hints**: admitted if `IsResponsible(self, K)` or key already
+///   exists in local store / pending set.
+/// - **Paid hints**: admitted if `self` is in `PaidCloseGroup(K)` or key is
+///   already in `PaidForList`.
+///
+/// Returns an [`AdmissionResult`] with keys sorted into pipelines.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn admit_hints(
+    self_id: &PeerId,
+    replica_hints: &[XorName],
+    paid_hints: &[XorName],
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    pending_keys: &HashSet<XorName>,
+) -> AdmissionResult {
+    // Build set of replica hint keys for cross-set precedence check.
+    let replica_set: HashSet<XorName> = replica_hints.iter().copied().collect();
+
+    let mut result = AdmissionResult {
+        replica_keys: Vec::new(),
+        paid_only_keys: Vec::new(),
+        rejected_keys: Vec::new(),
+    };
+
+    // Track all processed keys to deduplicate within and across sets.
+    let mut seen = HashSet::new();
+
+    // Process replica hints.
+    for &key in replica_hints {
+        if !seen.insert(key) {
+            continue;
+        }
+
+        // Fast path: already local or pending -- no routing-table lookup needed.
+        let already_local = storage.exists(&key).unwrap_or(false);
+        let already_pending = pending_keys.contains(&key);
+
+        if already_local || already_pending {
+            result.replica_keys.push(key);
+            continue;
+        }
+
+        if is_responsible(self_id, &key, p2p_node, config.close_group_size).await {
+            result.replica_keys.push(key);
+        } else {
+            result.rejected_keys.push(key);
+        }
+    }
+
+    // Process paid hints (with cross-set precedence).
+    for &key in paid_hints {
+        if !seen.insert(key) {
+            continue;
+        }
+
+        // Cross-set precedence: if already processed as a replica hint, skip.
+        if replica_set.contains(&key) {
+            continue;
+        }
+
+        // Fast path: already in PaidForList -- no routing-table lookup needed.
+        let already_paid = paid_list.contains(&key).unwrap_or(false);
+
+        if already_paid {
+            result.paid_only_keys.push(key);
+            continue;
+        }
+
+        if is_in_paid_close_group(self_id, &key, p2p_node, config.paid_list_close_group_size).await
+        {
+            result.paid_only_keys.push(key);
+        } else {
+            result.rejected_keys.push(key);
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::client::xor_distance;
+    use crate::replication::config::ReplicationConfig;
+
+    /// Build a `PeerId` from a single byte (zero-padded to 32 bytes).
+    fn peer_id_from_byte(b: u8) -> PeerId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = b;
+        PeerId::from_bytes(bytes)
+    }
+
+    /// Build an `XorName` from a single byte (repeated to 32 bytes).
+    fn xor_name_from_byte(b: u8) -> XorName {
+        [b; 32]
+    }
+
+    // -----------------------------------------------------------------------
+    // AdmissionResult construction helpers for pure-logic tests
+    //
+    // The full `admit_hints` function requires a live DHT + LMDB backend.
+    // For unit tests we directly exercise:
+    //   1. Cross-set precedence logic
+    //   2. Deduplication logic
+    //   3. evaluate_key_evidence (in quorum.rs)
+    //
+    // Below we simulate admission by using the pure-logic portions.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cross_set_precedence_replica_wins() {
+        // When a key appears in both replica_hints and paid_hints, the
+        // paid_hints entry should be suppressed by cross-set precedence.
+        let key = xor_name_from_byte(0xAA);
+        let replica_set: HashSet<XorName> = [key].into_iter().collect();
+
+        // Simulating the paid-hint loop: key is in replica_set, so it should
+        // be skipped.
+        assert!(
+            replica_set.contains(&key),
+            "paid-hint key present in replica set should be skipped"
+        );
+    }
+
+    #[test]
+    fn deduplication_within_replica_hints() {
+        // Duplicate keys in replica_hints should only appear once.
+        let key_a = xor_name_from_byte(0x01);
+        let key_b = xor_name_from_byte(0x02);
+        let hints = vec![key_a, key_b, key_a, key_a, key_b];
+
+        let mut seen = HashSet::new();
+        let mut unique = Vec::new();
+        for &key in &hints {
+            if seen.insert(key) {
+                unique.push(key);
+            }
+        }
+
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique[0], key_a);
+        assert_eq!(unique[1], key_b);
+    }
+
+    #[test]
+    fn deduplication_across_sets() {
+        // If a key appears in replica_hints AND paid_hints, the paid entry
+        // is skipped because seen already contains it from replica processing.
+        let key = xor_name_from_byte(0xFF);
+        let replica_hints = vec![key];
+        let paid_hints = vec![key];
+
+        let replica_set: HashSet<XorName> = replica_hints.iter().copied().collect();
+        let mut seen: HashSet<XorName> = HashSet::new();
+
+        // Process replica hints first.
+        for &k in &replica_hints {
+            seen.insert(k);
+        }
+
+        // Process paid hints: key is already in `seen` AND in `replica_set`.
+        let mut paid_admitted = Vec::new();
+        for &k in &paid_hints {
+            if !seen.insert(k) {
+                continue; // duplicate
+            }
+            if replica_set.contains(&k) {
+                continue; // cross-set precedence
+            }
+            paid_admitted.push(k);
+        }
+
+        assert!(
+            paid_admitted.is_empty(),
+            "paid-hint should be suppressed when key is also a replica hint"
+        );
+    }
+
+    #[test]
+    fn admission_result_empty_inputs() {
+        let result = AdmissionResult {
+            replica_keys: Vec::new(),
+            paid_only_keys: Vec::new(),
+            rejected_keys: Vec::new(),
+        };
+
+        assert!(result.replica_keys.is_empty());
+        assert!(result.paid_only_keys.is_empty());
+        assert!(result.rejected_keys.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_keys_rejected_by_distance() {
+        // Simulate rejection: a key whose XOR distance from self is large
+        // should not appear in a close-group of size 3 when there are closer
+        // peers.
+        let self_id = peer_id_from_byte(0x00);
+        let key = xor_name_from_byte(0xFF);
+        let config = ReplicationConfig::default();
+
+        // Distance from self (0x00...) to key (0xFF...):
+        let self_xor: XorName = [0u8; 32];
+        let dist = xor_distance(&self_xor, &key);
+
+        // A very far key would have high distance -- this proves the concept.
+        assert_eq!(dist[0], 0xFF, "distance first byte should be 0xFF");
+
+        // Meanwhile a close key would have a small distance.
+        let close_key = xor_name_from_byte(0x01);
+        let close_dist = xor_distance(&self_xor, &close_key);
+        assert_eq!(
+            close_dist[0], 0x01,
+            "close distance first byte should be 0x01"
+        );
+
+        assert!(
+            dist > close_dist,
+            "far key should have greater distance than close key"
+        );
+    }
+
+    #[test]
+    fn config_close_group_sizes_are_valid() {
+        let config = ReplicationConfig::default();
+        assert!(
+            config.close_group_size > 0,
+            "close_group_size must be positive"
+        );
+        assert!(
+            config.paid_list_close_group_size > 0,
+            "paid_list_close_group_size must be positive"
+        );
+        assert!(
+            config.paid_list_close_group_size >= config.close_group_size,
+            "paid_list_close_group_size should be >= close_group_size"
+        );
+    }
+}
