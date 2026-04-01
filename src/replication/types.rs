@@ -610,7 +610,7 @@ mod tests {
     /// #13: Bootstrap not drained while `pending_keys` overlap with the
     /// pipeline. Keys must be removed from `pending_keys` for drain to occur.
     #[test]
-    fn scenario_13_bootstrap_drain_with_pending_keys() {
+    fn bootstrap_drain_requires_empty_pending_keys() {
         let key_a: XorName = [0xA0; 32];
         let key_b: XorName = [0xB0; 32];
         let key_c: XorName = [0xC0; 32];

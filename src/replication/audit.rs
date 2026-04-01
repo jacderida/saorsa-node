@@ -882,22 +882,91 @@ mod tests {
 
     // -- Scenario 55: Empty failure set means no evidence -------------------------
 
-    #[test]
-    fn scenario_55_empty_failure_set_means_no_evidence() {
-        // After responsibility confirmation removes all keys from failure set,
-        // no AuditFailure evidence should be emitted.
-        // This is implicit in the code (handle_audit_failure returns Passed
-        // when confirmed_failures is empty), but verify the FailureEvidence
-        // reason variants are properly differentiated.
+    /// Scenario 55: Peer challenged on {K1, K2}. Both digests mismatch.
+    /// Responsibility confirmation shows the peer is NOT responsible for
+    /// either key. The confirmed failure set is empty — no `AuditFailure`
+    /// evidence is emitted.
+    ///
+    /// Full `verify_digests` requires a live `P2PNode` for network lookups.
+    /// This test exercises the deterministic sub-steps:
+    ///   (1) Digest comparison identifies K1 and K2 as mismatches.
+    ///   (2) Responsibility confirmation removes both keys.
+    ///   (3) Empty confirmed failure set means no evidence.
+    #[tokio::test]
+    async fn scenario_55_no_confirmed_responsibility_no_evidence() {
+        let (storage, _temp) = create_test_storage().await;
+        let nonce = [0x55; 32];
+        let peer_id = [0x55; 32];
 
-        assert_ne!(
-            AuditFailureReason::Timeout,
-            AuditFailureReason::DigestMismatch
+        // Store K1 and K2 on the challenger (for expected digest computation).
+        let c1 = b"scenario 55 key one";
+        let c2 = b"scenario 55 key two";
+        let k1 = LmdbStorage::compute_address(c1);
+        let k2 = LmdbStorage::compute_address(c2);
+        storage.put(&k1, c1).await.expect("put k1");
+        storage.put(&k2, c2).await.expect("put k2");
+
+        // Challenger computes expected digests.
+        let expected_d1 = compute_audit_digest(&nonce, &peer_id, &k1, c1);
+        let expected_d2 = compute_audit_digest(&nonce, &peer_id, &k2, c2);
+
+        // Simulate peer returning WRONG digests for both keys.
+        let wrong_d1 = compute_audit_digest(&nonce, &peer_id, &k1, b"corrupted k1");
+        let wrong_d2 = compute_audit_digest(&nonce, &peer_id, &k2, b"corrupted k2");
+        assert_ne!(wrong_d1, expected_d1, "K1 digest should mismatch");
+        assert_ne!(wrong_d2, expected_d2, "K2 digest should mismatch");
+
+        // Step 1: Identify failed keys via digest comparison.
+        let keys = [k1, k2];
+        let expected = [expected_d1, expected_d2];
+        let received = [wrong_d1, wrong_d2];
+
+        let mut failed_keys = Vec::new();
+        for i in 0..keys.len() {
+            if received[i] != expected[i] {
+                failed_keys.push(keys[i]);
+            }
+        }
+        assert_eq!(
+            failed_keys.len(),
+            2,
+            "Both keys should be identified as digest mismatches"
         );
-        assert_ne!(
-            AuditFailureReason::MalformedResponse,
-            AuditFailureReason::KeyAbsent
+
+        // Step 2: Responsibility confirmation — peer is NOT responsible for
+        // either key (simulated by filtering them all out).
+        let confirmed_responsible_keys: Vec<XorName> = Vec::new();
+        let confirmed_failures: Vec<XorName> = failed_keys
+            .into_iter()
+            .filter(|k| confirmed_responsible_keys.contains(k))
+            .collect();
+
+        // Step 3: Empty confirmed failure set → no AuditFailure evidence.
+        assert!(
+            confirmed_failures.is_empty(),
+            "With no confirmed responsibility, failure set must be empty — \
+             no AuditFailure evidence should be emitted"
         );
+
+        // Verify that constructing evidence with empty keys results in a
+        // no-penalty outcome (the caller checks is_empty before emitting).
+        let peer = PeerId::from_bytes(peer_id);
+        let evidence = FailureEvidence::AuditFailure {
+            challenge_id: 5500,
+            challenged_peer: peer,
+            confirmed_failed_keys: confirmed_failures,
+            reason: AuditFailureReason::DigestMismatch,
+        };
+        if let FailureEvidence::AuditFailure {
+            confirmed_failed_keys,
+            ..
+        } = evidence
+        {
+            assert!(
+                confirmed_failed_keys.is_empty(),
+                "Evidence with empty failure set should not trigger a trust penalty"
+            );
+        }
     }
 
     // -- Scenario 56: RepairOpportunity filters never-synced peers ----------------

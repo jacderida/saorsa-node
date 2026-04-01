@@ -643,17 +643,17 @@ async fn test_fetch_returns_error_for_corrupt_key() {
 }
 
 // =========================================================================
-// Section 18, Scenario #3: Neighbor-sync unknown key quorum pass -> stored
+// Section 18, Scenario #1/#24: Fresh replication stores + PaidNotify
 // =========================================================================
 
 /// Fresh replication stores chunk on remote peer AND updates their `PaidForList`
-/// (Section 18 #3).
+/// (Section 18 #1 + #24 combined).
 ///
 /// Store a chunk on node A, call `replicate_fresh`, wait for propagation, then
 /// verify at least one remote node has the chunk in both storage and `PaidForList`.
 #[tokio::test]
 #[serial]
-async fn scenario_3_fresh_replication_stores_and_updates_paid_list() {
+async fn scenario_1_and_24_fresh_replication_stores_and_propagates_paid_list() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
@@ -818,22 +818,24 @@ async fn scenario_11_repeated_failures_decrease_trust() {
 // Section 18, Scenario #12: Bootstrap quorum aggregation
 // =========================================================================
 
-/// Store chunks on multiple nodes and verify storage + paid-list consistency
-/// (Section 18 #12).
+/// A bootstrapping node queries multiple peers and discovers that a key
+/// meets the multi-peer presence threshold (Section 18 #12).
 ///
-/// Simulates the state a bootstrapping node would discover: keys that exist
-/// on multiple peers with paid-list entries.
+/// Store a chunk on nodes 0-3 (4 holders), then have node 4 send
+/// verification requests to all holders. The querying node should receive
+/// enough presence confirmations to meet the quorum threshold.
 #[tokio::test]
 #[serial]
-async fn scenario_12_bootstrap_discovers_keys() {
+async fn scenario_12_bootstrap_quorum_aggregation() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
-    // Store a chunk on nodes 3 and 4
-    let content = b"bootstrap discovery test";
+    let content = b"bootstrap quorum test";
     let address = compute_address(content);
 
-    for idx in [3, 4] {
+    // Store chunk + paid-list entry on nodes 0-3 (4 holders)
+    let holder_count = 4;
+    for idx in 0..holder_count {
         let node = harness.test_node(idx).expect("node");
         let protocol = node.ant_protocol.as_ref().expect("protocol");
         protocol
@@ -841,8 +843,6 @@ async fn scenario_12_bootstrap_discovers_keys() {
             .put(&address, content)
             .await
             .expect("put");
-        protocol.payment_verifier().cache_insert(address);
-        // Add to paid list
         if let Some(ref engine) = node.replication_engine {
             engine
                 .paid_list()
@@ -852,21 +852,52 @@ async fn scenario_12_bootstrap_discovers_keys() {
         }
     }
 
-    // Verify both nodes have storage AND paid-list entries
-    for idx in [3, 4] {
-        let node = harness.test_node(idx).expect("node");
-        let protocol = node.ant_protocol.as_ref().expect("protocol");
-        assert!(
-            protocol.storage().exists(&address).unwrap(),
-            "Node {idx} should have the chunk in storage"
-        );
-        if let Some(ref engine) = node.replication_engine {
-            assert!(
-                engine.paid_list().contains(&address).unwrap(),
-                "Node {idx} should have the key in PaidForList"
-            );
+    // Node 4 acts as the bootstrapping node: query each holder for presence
+    let querier = harness.test_node(4).expect("querier");
+    let p2p_q = querier.p2p_node.as_ref().expect("p2p");
+
+    let mut presence_confirmations = 0u32;
+    let mut paid_confirmations = 0u32;
+    for idx in 0..holder_count {
+        let target = harness.test_node(idx).expect("target");
+        let peer = *target.p2p_node.as_ref().expect("p2p").peer_id();
+
+        let request = VerificationRequest {
+            keys: vec![address],
+            paid_list_check_indices: vec![0],
+        };
+        let msg = ReplicationMessage {
+            request_id: 1200 + idx as u64,
+            body: ReplicationMessageBody::VerificationRequest(request),
+        };
+
+        let resp_msg = send_replication_request(p2p_q, &peer, msg, Duration::from_secs(10)).await;
+        if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
+            if let Some(result) = resp.results.first() {
+                if result.present {
+                    presence_confirmations += 1;
+                }
+                if result.paid == Some(true) {
+                    paid_confirmations += 1;
+                }
+            }
         }
     }
+
+    // Quorum threshold is floor(CLOSE_GROUP_SIZE/2)+1 = 4, but dynamic
+    // QuorumNeeded uses min(4, floor(|targets|/2)+1). With 4 targets:
+    // min(4, 3) = 3. Require at least 3 confirmations.
+    let min_quorum = 3;
+    assert!(
+        presence_confirmations >= min_quorum,
+        "Bootstrap node should receive enough presence confirmations for quorum: \
+         got {presence_confirmations}, need {min_quorum}"
+    );
+    assert!(
+        paid_confirmations >= min_quorum,
+        "Bootstrap node should receive enough paid-list confirmations: \
+         got {paid_confirmations}, need {min_quorum}"
+    );
 
     harness.teardown().await.expect("teardown");
 }
@@ -875,40 +906,73 @@ async fn scenario_12_bootstrap_discovers_keys() {
 // Section 18, Scenario #14: Coverage under backlog
 // =========================================================================
 
-/// All locally stored keys appear in `all_keys()`, ensuring neighbor-sync
-/// hint construction covers the full local inventory (Section 18 #14).
+/// Under load, neighbor-sync hint construction covers the full local
+/// inventory: when node A stores multiple chunks and node B sends a
+/// `NeighborSyncRequest`, A's response hints include all locally stored
+/// keys that B should hold (Section 18 #14).
 #[tokio::test]
 #[serial]
-async fn scenario_14_hint_construction_covers_all_local_keys() {
+async fn scenario_14_sync_hints_cover_all_local_keys() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
-    let node = harness.test_node(3).expect("node");
-    let protocol = node.ant_protocol.as_ref().expect("protocol");
-    let storage = protocol.storage();
+    let node_a = harness.test_node(3).expect("node_a");
+    let node_b = harness.test_node(4).expect("node_b");
+    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
+    let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
 
-    // Store multiple chunks
+    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol_a");
+    let storage_a = protocol_a.storage();
+
+    // Store multiple chunks on node A (simulating backlog)
     let chunk_count = 10u8;
     let mut addresses = Vec::new();
     for i in 0..chunk_count {
         let content = format!("backlog test chunk {i}");
         let address = compute_address(content.as_bytes());
-        storage
+        storage_a
             .put(&address, content.as_bytes())
             .await
             .expect("put");
         addresses.push(address);
     }
 
-    // Verify all_keys returns all stored keys
-    let all_keys = storage.all_keys().expect("all_keys");
+    // Verify the local inventory is complete
+    let all_keys = storage_a.all_keys().expect("all_keys");
+    assert_eq!(
+        all_keys.len(),
+        addresses.len(),
+        "all_keys should cover every stored chunk"
+    );
+
+    // Send a NeighborSyncRequest from B to A and inspect the response hints.
+    let request = NeighborSyncRequest {
+        replica_hints: vec![],
+        paid_hints: vec![],
+        bootstrapping: false,
+    };
+    let msg = ReplicationMessage {
+        request_id: 1400,
+        body: ReplicationMessageBody::NeighborSyncRequest(request),
+    };
+
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
+    let hints = match resp_msg.body {
+        ReplicationMessageBody::NeighborSyncResponse(resp) => resp.replica_hints,
+        other => panic!("Expected NeighborSyncResponse, got: {other:?}"),
+    };
+
+    // Node A builds replica hints for B based on B's close-group membership.
+    // In a 5-node network every node is close to every key, so the hints
+    // should include ALL locally stored keys.
     for addr in &addresses {
         assert!(
-            all_keys.contains(addr),
-            "all_keys should include every stored key"
+            hints.contains(addr),
+            "Sync response hints should include stored key {addr:?}; \
+             got {} hints total",
+            hints.len()
         );
     }
-    assert_eq!(all_keys.len(), addresses.len());
 
     harness.teardown().await.expect("teardown");
 }
@@ -917,29 +981,29 @@ async fn scenario_14_hint_construction_covers_all_local_keys() {
 // Section 18, Scenario #15: Partition and heal
 // =========================================================================
 
-/// Data survives a network partition (node shutdown). The remaining node
-/// retains the chunk and its `PaidForList` entry (Section 18 #15).
+/// Partition and heal: data and paid-list authorization survive a network
+/// partition. After the partition, remaining nodes can still confirm
+/// paid-list status via verification requests, enabling recovery
+/// (Section 18 #15).
 #[tokio::test]
 #[serial]
 async fn scenario_15_partition_and_heal() {
     let mut harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
-    // Store a chunk on node 3
-    let address;
     let content = b"partition test data";
-    {
-        let node3 = harness.test_node(3).expect("node3");
-        let protocol3 = node3.ant_protocol.as_ref().expect("protocol");
-        address = compute_address(content);
-        protocol3
+    let address = compute_address(content);
+
+    // Store chunk + paid-list entry on nodes 3 AND 4
+    for idx in [3, 4] {
+        let node = harness.test_node(idx).expect("node");
+        let protocol = node.ant_protocol.as_ref().expect("protocol");
+        protocol
             .storage()
             .put(&address, content)
             .await
             .expect("put");
-
-        // Add to paid list so it survives verification
-        if let Some(ref engine) = node3.replication_engine {
+        if let Some(ref engine) = node.replication_engine {
             engine
                 .paid_list()
                 .insert(&address)
@@ -948,28 +1012,47 @@ async fn scenario_15_partition_and_heal() {
         }
     }
 
-    // "Partition": shut down node 4
+    // "Partition": shut down node 4 (simulates peer loss)
     harness.shutdown_node(4).await.expect("shutdown");
 
     // Data should still exist on node 3
     let node3 = harness.test_node(3).expect("node3 after partition");
+    let protocol3 = node3.ant_protocol.as_ref().expect("protocol");
     assert!(
-        node3
-            .ant_protocol
-            .as_ref()
-            .unwrap()
-            .storage()
-            .exists(&address)
-            .unwrap(),
+        protocol3.storage().exists(&address).expect("exists"),
         "Data should survive partition on remaining node"
     );
 
-    // Paid list should also survive
-    if let Some(ref engine) = node3.replication_engine {
+    // Paid-list authorization still confirmable: query remaining nodes
+    // (0,1,2,3) from node 0. Node 3 should confirm paid status.
+    let querier = harness.test_node(0).expect("querier");
+    let p2p_q = querier.p2p_node.as_ref().expect("p2p");
+
+    let node3_peer = *node3.p2p_node.as_ref().expect("p2p").peer_id();
+    let request = VerificationRequest {
+        keys: vec![address],
+        paid_list_check_indices: vec![0],
+    };
+    let msg = ReplicationMessage {
+        request_id: 1500,
+        body: ReplicationMessageBody::VerificationRequest(request),
+    };
+
+    let resp_msg = send_replication_request(p2p_q, &node3_peer, msg, Duration::from_secs(10)).await;
+    if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
+        let result = resp.results.first().expect("should have a result");
         assert!(
-            engine.paid_list().contains(&address).unwrap(),
-            "PaidForList should survive partition"
+            result.present,
+            "Node 3 should still report chunk as present after partition"
         );
+        assert_eq!(
+            result.paid,
+            Some(true),
+            "Node 3 should still confirm paid-list status — this enables recovery \
+             when paid-list authorization survives the partition"
+        );
+    } else {
+        panic!("Expected VerificationResponse");
     }
 
     harness.teardown().await.expect("teardown");
@@ -979,15 +1062,17 @@ async fn scenario_15_partition_and_heal() {
 // Section 18, Scenario #17: Admission asymmetry
 // =========================================================================
 
-/// A `NeighborSyncRequest` from any peer returns a valid
-/// `NeighborSyncResponse`, regardless of routing-table membership
-/// (Section 18 #17).
+/// When sender IS in receiver's `LocalRT`, sync is bidirectional: the
+/// receiver sends outbound hints AND accepts inbound hints. This test
+/// verifies the outbound direction: after warmup (all nodes in each
+/// other's RT), node A stores data, node B sends sync, and A's response
+/// includes replica hints for its stored keys (Section 18 #17).
 ///
-/// The protocol always replies with outbound hints; inbound hint acceptance
-/// depends on RT membership, but we verify the response is well-formed.
+/// The inbound admission guard (dropping hints from non-RT senders) is
+/// tested in the unit-level `admission.rs` tests.
 #[tokio::test]
 #[serial]
-async fn scenario_17_admission_requires_sender_in_rt() {
+async fn scenario_17_bidirectional_sync_when_sender_in_rt() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
@@ -996,10 +1081,20 @@ async fn scenario_17_admission_requires_sender_in_rt() {
     let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
     let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
 
-    // Send sync request with a hint for a fabricated key
-    let fake_key = [0x17; 32];
+    // Store data on node A so it has something to hint about
+    let content = b"admission asymmetry test";
+    let address = compute_address(content);
+    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol");
+    protocol_a
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put");
+
+    // B sends sync request with a hint for a fabricated key
+    let inbound_hint = [0x17; 32];
     let request = NeighborSyncRequest {
-        replica_hints: vec![fake_key],
+        replica_hints: vec![inbound_hint],
         paid_hints: vec![],
         bootstrapping: false,
     };
@@ -1009,15 +1104,22 @@ async fn scenario_17_admission_requires_sender_in_rt() {
     };
 
     let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
-    // Response should be a valid NeighborSyncResponse regardless of RT membership
-    assert!(
-        matches!(
-            resp_msg.body,
-            ReplicationMessageBody::NeighborSyncResponse(_)
-        ),
-        "Expected NeighborSyncResponse, got: {:?}",
-        resp_msg.body
-    );
+    match resp_msg.body {
+        ReplicationMessageBody::NeighborSyncResponse(resp) => {
+            assert!(!resp.bootstrapping, "Node A should not claim bootstrapping");
+
+            // A should send outbound hints back to B — in a 5-node network
+            // after warmup, B is in A's close group for all keys, so A's
+            // stored key should appear in the replica hints.
+            assert!(
+                resp.replica_hints.contains(&address),
+                "When sender is in receiver's RT, receiver should send outbound \
+                 replica hints. Expected address {address:?} in hints, got {} hints.",
+                resp.replica_hints.len()
+            );
+        }
+        other => panic!("Expected NeighborSyncResponse, got: {other:?}"),
+    }
 
     harness.teardown().await.expect("teardown");
 }

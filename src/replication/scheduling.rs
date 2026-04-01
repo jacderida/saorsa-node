@@ -687,4 +687,74 @@ mod tests {
             "pipeline should remain Replica after duplicate rejection"
         );
     }
+
+    /// Scenario 3: Neighbor-sync unknown key transitions through the full
+    /// state machine to stored.
+    ///
+    /// Exercises the complete queue pipeline that a key follows when it
+    /// arrives as a neighbor-sync hint, passes quorum verification, is
+    /// fetched, and completes:
+    ///   `PendingVerify` → (quorum pass) → `QueuedForFetch` → `Fetching` → `Stored`
+    #[test]
+    fn scenario_3_neighbor_sync_quorum_pass_full_pipeline() {
+        let mut queues = ReplicationQueues::new(10);
+        let key = xor_name_from_byte(0x03);
+        let distance = xor_name_from_byte(0x01);
+        let source_a = peer_id_from_byte(1);
+        let source_b = peer_id_from_byte(2);
+        let hint_sender = peer_id_from_byte(3);
+
+        // Stage 1: Hint admitted → PendingVerify
+        let entry = VerificationEntry {
+            state: VerificationState::PendingVerify,
+            pipeline: HintPipeline::Replica,
+            verified_sources: Vec::new(),
+            tried_sources: HashSet::new(),
+            created_at: Instant::now(),
+            hint_sender,
+        };
+        assert!(
+            queues.add_pending_verify(key, entry),
+            "new key should be admitted to PendingVerify"
+        );
+        assert!(queues.contains_key(&key));
+        assert_eq!(queues.pending_count(), 1);
+
+        // Stage 2: Quorum passes — remove from pending and enqueue for fetch
+        // with the verified sources discovered during the quorum round.
+        let removed = queues.remove_pending(&key);
+        assert!(removed.is_some(), "key should exist in pending");
+        assert_eq!(queues.pending_count(), 0);
+
+        queues.enqueue_fetch(key, distance, vec![source_a, source_b]);
+        assert_eq!(queues.fetch_queue_count(), 1);
+        assert!(
+            queues.contains_key(&key),
+            "key should be in pipeline (fetch queue)"
+        );
+
+        // Stage 3: Dequeue → Fetching
+        let candidate = queues.dequeue_fetch().expect("should dequeue");
+        assert_eq!(candidate.key, key);
+        assert_eq!(candidate.sources.len(), 2);
+        queues.start_fetch(key, source_a, candidate.sources);
+        assert_eq!(queues.in_flight_count(), 1);
+        assert_eq!(queues.fetch_queue_count(), 0);
+        assert!(
+            queues.contains_key(&key),
+            "key should be in pipeline (in-flight)"
+        );
+
+        // Stage 4: Fetch completes → Stored
+        let completed = queues.complete_fetch(&key);
+        assert!(
+            completed.is_some(),
+            "should have in-flight entry to complete"
+        );
+        assert_eq!(queues.in_flight_count(), 0);
+        assert!(
+            !queues.contains_key(&key),
+            "key should be fully processed out of pipeline"
+        );
+    }
 }

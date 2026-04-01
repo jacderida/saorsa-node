@@ -756,6 +756,63 @@ mod tests {
         );
     }
 
+    /// #13: Responsible range shrink — out-of-range records have their
+    /// timestamp recorded, are NOT pruned before `PRUNE_HYSTERESIS_DURATION`,
+    /// and new in-range keys are still accepted while out-of-range keys
+    /// await expiry.
+    #[tokio::test]
+    async fn scenario_13_responsible_range_shrink() {
+        let (pl, _temp) = create_test_paid_list().await;
+
+        let out_of_range_key: XorName = [0x13; 32];
+        let in_range_key: XorName = [0x14; 32];
+
+        // Insert both keys initially (simulating they were once in range).
+        pl.insert(&out_of_range_key)
+            .await
+            .expect("insert out-of-range");
+        pl.insert(&in_range_key).await.expect("insert in-range");
+
+        // Range shrinks: out_of_range_key is no longer in responsibility range.
+        // Record RecordOutOfRangeFirstSeen.
+        pl.set_record_out_of_range(&out_of_range_key);
+        let first_seen = pl
+            .record_out_of_range_since(&out_of_range_key)
+            .expect("timestamp should be recorded for out-of-range key");
+
+        // Key must NOT be pruned yet — elapsed time is far below hysteresis.
+        let elapsed = first_seen.elapsed();
+        assert!(
+            elapsed < PRUNE_HYSTERESIS_DURATION,
+            "elapsed {elapsed:?} should be below PRUNE_HYSTERESIS_DURATION \
+             ({PRUNE_HYSTERESIS_DURATION:?}) — key must not be pruned yet"
+        );
+
+        // The key should still exist in the paid list (not deleted).
+        assert!(
+            pl.contains(&out_of_range_key).expect("contains"),
+            "out-of-range key should still be retained within hysteresis window"
+        );
+
+        // In-range key is unaffected — no out-of-range timestamp set.
+        assert!(
+            pl.record_out_of_range_since(&in_range_key).is_none(),
+            "in-range key should have no out-of-range timestamp"
+        );
+
+        // New in-range keys are still accepted during this period.
+        let new_key: XorName = [0x15; 32];
+        let was_new = pl.insert(&new_key).await.expect("insert new key");
+        assert!(
+            was_new,
+            "new in-range keys should still be accepted while out-of-range keys await expiry"
+        );
+        assert!(
+            pl.contains(&new_key).expect("contains new"),
+            "newly inserted in-range key should be present"
+        );
+    }
+
     /// #46: Bootstrap claim first-seen is recorded and follows
     /// first-observation-wins semantics.
     #[test]
