@@ -53,11 +53,11 @@ use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::scheduling::ReplicationQueues;
 use crate::replication::types::{
     BootstrapState, FailureEvidence, HintPipeline, NeighborSyncState, PeerSyncRecord,
-    TopologyEventKind, VerificationEntry, VerificationState,
+    VerificationEntry, VerificationState,
 };
 use crate::storage::LmdbStorage;
 use saorsa_core::identity::PeerId;
-use saorsa_core::{P2PEvent, P2PNode, TrustEvent};
+use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -216,7 +216,8 @@ impl ReplicationEngine {
 
     #[allow(clippy::too_many_lines)]
     fn start_message_handler(&mut self) {
-        let mut events = self.p2p_node.subscribe_events();
+        let mut p2p_events = self.p2p_node.subscribe_events();
+        let mut dht_events = self.p2p_node.dht_manager().subscribe_events();
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
         let paid_list = Arc::clone(&self.paid_list);
@@ -233,84 +234,66 @@ impl ReplicationEngine {
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
-                    event = events.recv() => {
+                    event = p2p_events.recv() => {
                         let Ok(event) = event else { continue };
-                        match event {
-                            P2PEvent::Message {
-                                topic,
-                                source: Some(source),
-                                data,
-                            } => {
-                                // Determine if this is a replication message
-                                // and whether it arrived via the /rr/ request-response
-                                // path (which wraps payloads in RequestResponseEnvelope).
-                                let rr_info = if topic == REPLICATION_PROTOCOL_ID {
-                                    Some((data.clone(), None))
-                                } else if topic.starts_with(RR_PREFIX)
-                                    && &topic[RR_PREFIX.len()..] == REPLICATION_PROTOCOL_ID
-                                {
-                                    P2PNode::parse_request_envelope(&data)
-                                        .filter(|(_, is_resp, _)| !is_resp)
-                                        .map(|(msg_id, _, payload)| (payload, Some(msg_id)))
-                                } else {
-                                    None
-                                };
-                                if let Some((payload, rr_message_id)) = rr_info {
-                                    match handle_replication_message(
-                                        &source,
-                                        &payload,
-                                        &p2p,
-                                        &storage,
-                                        &paid_list,
-                                        &payment_verifier,
-                                        &queues,
-                                        &config,
-                                        &is_bootstrapping,
-                                        &sync_state,
-                                        &sync_history,
-                                        rr_message_id.as_deref(),
-                                    ).await {
-                                        Ok(()) => {}
-                                        Err(e) => {
-                                            debug!(
-                                                "Replication message from {source} error: {e}"
-                                            );
-                                        }
+                        if let P2PEvent::Message {
+                            topic,
+                            source: Some(source),
+                            data,
+                        } = event {
+                            // Determine if this is a replication message
+                            // and whether it arrived via the /rr/ request-response
+                            // path (which wraps payloads in RequestResponseEnvelope).
+                            let rr_info = if topic == REPLICATION_PROTOCOL_ID {
+                                Some((data.clone(), None))
+                            } else if topic.starts_with(RR_PREFIX)
+                                && &topic[RR_PREFIX.len()..] == REPLICATION_PROTOCOL_ID
+                            {
+                                P2PNode::parse_request_envelope(&data)
+                                    .filter(|(_, is_resp, _)| !is_resp)
+                                    .map(|(msg_id, _, payload)| (payload, Some(msg_id)))
+                            } else {
+                                None
+                            };
+                            if let Some((payload, rr_message_id)) = rr_info {
+                                match handle_replication_message(
+                                    &source,
+                                    &payload,
+                                    &p2p,
+                                    &storage,
+                                    &paid_list,
+                                    &payment_verifier,
+                                    &queues,
+                                    &config,
+                                    &is_bootstrapping,
+                                    &sync_state,
+                                    &sync_history,
+                                    rr_message_id.as_deref(),
+                                ).await {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        debug!(
+                                            "Replication message from {source} error: {e}"
+                                        );
                                     }
                                 }
                             }
-                            // Gap 4: Topology churn handling (Section 13).
-                            //
-                            // Signal the neighbor sync loop to run early rather
-                            // than running the sync round inline. Running it
-                            // here would block the message handler on
-                            // `send_request()` calls, deadlocking when
-                            // multiple nodes trigger sync simultaneously.
-                            P2PEvent::PeerConnected(peer_id, _addr) => {
-                                let kind = classify_topology_event(
-                                    &peer_id, &p2p, &config,
-                                ).await;
-                                if kind == TopologyEventKind::Trigger {
-                                    debug!(
-                                        "Close-group churn detected (connected {peer_id}), \
-                                         triggering early neighbor sync"
-                                    );
-                                    sync_trigger.notify_one();
-                                }
-                            }
-                            P2PEvent::PeerDisconnected(peer_id) => {
-                                let kind = classify_topology_event(
-                                    &peer_id, &p2p, &config,
-                                ).await;
-                                if kind == TopologyEventKind::Trigger {
-                                    debug!(
-                                        "Close-group churn detected (disconnected {peer_id}), \
-                                         triggering early neighbor sync"
-                                    );
-                                    sync_trigger.notify_one();
-                                }
-                            }
-                            P2PEvent::Message { .. } => {}
+                        }
+                    }
+                    // Gap 4: Topology churn handling (Section 13).
+                    //
+                    // The DHT routing table emits KClosestPeersChanged when the
+                    // K-closest peer set actually changes, which is the precise
+                    // signal for triggering neighbor sync. This replaces the
+                    // previous approach of checking every PeerConnected /
+                    // PeerDisconnected event against the close group.
+                    dht_event = dht_events.recv() => {
+                        let Ok(dht_event) = dht_event else { continue };
+                        if let DhtNetworkEvent::KClosestPeersChanged { .. } = dht_event {
+                            debug!(
+                                "K-closest peers changed, triggering early neighbor sync"
+                            );
+                            sync_trigger.notify_one();
                         }
                     }
                 }
@@ -1676,32 +1659,6 @@ async fn handle_audit_result(
             }
         }
         AuditTickResult::Idle | AuditTickResult::InsufficientKeys => {}
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Topology event classification (Gap 4 — Section 13)
-// ---------------------------------------------------------------------------
-
-/// Classify a topology event by checking if the peer is in our close
-/// neighborhood.
-async fn classify_topology_event(
-    peer: &PeerId,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-) -> TopologyEventKind {
-    let self_id = *p2p_node.peer_id();
-    let self_xor: XorName = *self_id.as_bytes();
-    let closest = p2p_node
-        .dht_manager()
-        .find_closest_nodes_local(&self_xor, config.neighbor_sync_scope)
-        .await;
-
-    let in_close_group = closest.iter().any(|n| n.peer_id == *peer);
-    if in_close_group {
-        TopologyEventKind::Trigger
-    } else {
-        TopologyEventKind::Ignore
     }
 }
 

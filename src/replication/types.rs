@@ -284,21 +284,6 @@ impl NeighborSyncState {
 }
 
 // ---------------------------------------------------------------------------
-// Topology change classification (Section 13)
-// ---------------------------------------------------------------------------
-
-/// Topology change classification for churn handling (Section 13).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TopologyEventKind {
-    /// Genuine close-group change — run neighbor sync.
-    Trigger,
-    /// Probable restart churn — suppress.
-    Skip,
-    /// Far peer change — no action needed.
-    Ignore,
-}
-
-// ---------------------------------------------------------------------------
 // Bootstrap drain state (Section 16)
 // ---------------------------------------------------------------------------
 
