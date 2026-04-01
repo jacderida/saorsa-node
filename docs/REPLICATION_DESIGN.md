@@ -428,8 +428,8 @@ Rules:
 2. Replication MUST NOT apply threshold-based peer eviction; eviction/quarantine decisions are owned by `AdaptiveDHT` (which evicts peers whose trust score falls below `block_threshold`).
 3. A `ReplicationFailure` is emitted per peer per failed fetch attempt, not per key. If a key requires two retries from two different peers before succeeding on the third, each of the two failed peers emits one failure event.
 4. Replication SHOULD mark fetch-failure evidence as stale/low-confidence if the key later succeeds via an alternate verified source.
-5. On audit failure, replication MUST first run the responsibility confirmation (Section 15 step 12). If the confirmed failure set is non-empty, emit `AuditFailure` evidence with `challenge_id`, `challenged_peer_id`, confirmed failure keys, and failure reason. If the confirmed failure set is empty, no `AuditFailure` is emitted.
-6. Replication MUST emit a trust-penalty signal to `TrustEngine` (via `report_trust_event` with `ApplicationFailure(weight)`) for audit failure only when both conditions hold: the confirmed failure set from responsibility confirmation is non-empty (Section 15 step 12d) AND `RepairOpportunity(challenged_peer_id, confirmed_failure_keys)` is true.
+5. On audit failure, replication MUST first run the responsibility confirmation (Section 15 step 9). If the confirmed failure set is non-empty, emit `AuditFailure` evidence with `challenge_id`, `challenged_peer_id`, confirmed failure keys, and failure reason. If the confirmed failure set is empty, no `AuditFailure` is emitted.
+6. Replication MUST emit a trust-penalty signal to `TrustEngine` (via `report_trust_event` with `ApplicationFailure(weight)`) for audit failure only when both conditions hold: the confirmed failure set from responsibility confirmation is non-empty (Section 15 step 9d) AND `RepairOpportunity(challenged_peer_id, confirmed_failure_keys)` is true.
 7. On bootstrap claim past grace period, replication MUST emit `BootstrapClaimAbuse` evidence with `peer_id` and `BootstrapClaimFirstSeen` timestamp. Evidence is emitted on each sync or audit attempt where the peer claims bootstrapping after `BOOTSTRAP_CLAIM_GRACE_PERIOD`.
 8. When a peer that previously claimed bootstrap status stops claiming it (responds normally to sync or audit), node MUST clear `BootstrapClaimFirstSeen(self, peer)`.
 9. Final trust-score updates and any eventual peer eviction are determined by `TrustEngine` / `AdaptiveDHT`, not by replication logic.
@@ -439,19 +439,16 @@ Rules:
 Challenge-response for claimed holders:
 
 1. Challenger creates unique challenge id + nonce.
-2. Challenger samples `SeedKeys` uniformly at random from locally stored record keys, with `|SeedKeys| = max(floor(sqrt(local_store_key_count)), 1)` (capped at `local_store_key_count`). If local store is empty, the audit tick is idle.
-3. For each `K` in `SeedKeys`, challenger finds the closest peers from the local routing table and records the returned closest-peer set for `K`.
-4. Challenger builds `CandidatePeers` as the union of returned peers across all sampled keys (all are already in `LocalRT(self)` by construction).
-5. Challenger removes peers from `CandidatePeersRT` for which `RepairOpportunity(P, _)` is false — that is, peers that have never been synced with or have not had at least one subsequent neighbor-sync cycle to repair. Auditing such peers wastes network resources on challenges they cannot pass.
-6. Challenger builds `PeerKeySet(P)` for each `P` in `CandidatePeersRT` as the subset of `SeedKeys` whose lookup result included `P`. This derivation MUST use only lookup results from step 3 (no additional lookup requests).
-7. Challenger removes peers with empty `PeerKeySet(P)`. If no peers remain, the audit tick is idle.
-8. Challenger selects one peer uniformly at random from remaining peers as `challenged_peer_id`.
-9. Challenger sends that peer an ordered challenge key set equal to `PeerKeySet(challenged_peer_id)`.
-10. Target responds with either per-key `AuditKeyDigest` values or a bootstrapping claim:
+2. Challenger selects one peer uniformly at random from peers with `RepairOpportunity` as `challenged_peer_id`. If no eligible peers exist, the audit tick is idle.
+3. Challenger samples `SeedKeys` uniformly at random from locally stored record keys, with `|SeedKeys| = max(floor(sqrt(local_store_key_count)), 1)` (capped at `local_store_key_count`). If local store is empty, the audit tick is idle.
+4. For each `K` in `SeedKeys`, challenger checks whether `challenged_peer_id` appears in the `CLOSE_GROUP_SIZE` closest peers for `K` via local RT lookup. Keys where the peer is not responsible are discarded. The remaining keys form `PeerKeySet(challenged_peer_id)`.
+5. If `PeerKeySet` is empty, the audit tick is idle.
+6. Challenger sends `challenged_peer_id` an ordered challenge key set equal to `PeerKeySet(challenged_peer_id)`.
+7. Target responds with either per-key `AuditKeyDigest` values or a bootstrapping claim:
     a. Per-key digests: for each challenged key `K_i` (in challenge order), target computes `AuditKeyDigest(K_i) = H(nonce || challenged_peer_id || K_i || record_bytes_i)`, where `record_bytes_i` is the full raw bytes of the record for `K_i`. Target returns the ordered list of per-key digests. If the target does not hold a challenged key, it MUST signal absence for that position (e.g., a sentinel/empty digest); it MUST NOT omit the position silently.
     b. Bootstrapping claim: target asserts it is still bootstrapping. Challenger applies the bootstrap-claim grace logic (Section 6.2 rule 3b): record `BootstrapClaimFirstSeen` if first observation, accept without penalty within `BOOTSTRAP_CLAIM_GRACE_PERIOD`, emit `BootstrapClaimAbuse` evidence if past grace period. Audit tick ends (no digest verification).
-11. On per-key digest response, challenger recomputes the expected `AuditKeyDigest(K_i)` for each challenged key from local copies and verifies equality per key before deadline. Each key is independently classified as passed (digest matches) or failed (mismatch, absent, or malformed).
-12. On any per-key audit failures (timeout, malformed response, or one or more `AuditKeyDigest` mismatches/absences), challenger MUST perform a responsibility confirmation for each failed key before emitting penalty evidence:
+8. On per-key digest response, challenger recomputes the expected `AuditKeyDigest(K_i)` for each challenged key from local copies and verifies equality per key before deadline. Each key is independently classified as passed (digest matches) or failed (mismatch, absent, or malformed).
+9. On any per-key audit failures (timeout, malformed response, or one or more `AuditKeyDigest` mismatches/absences), challenger MUST perform a responsibility confirmation for each failed key before emitting penalty evidence:
     a. For each failed key `K` in `PeerKeySet(challenged_peer_id)`, perform a fresh local RT closest-peer lookup for `K`.
     b. If `challenged_peer_id` does not appear in the fresh lookup result for key `K`, remove `K` from the failure set (peer is not currently responsible).
     c. If the filtered failure set is empty after all lookups, discard the audit failure entirely — no `AuditFailure` evidence or trust-penalty signal is emitted.
@@ -473,7 +470,7 @@ Audit challenge bound:
 
 Failure conditions:
 
-- Timeout, malformed response, or per-key `AuditKeyDigest` mismatch/absence — subject to responsibility confirmation (step 12) before penalty.
+- Timeout, malformed response, or per-key `AuditKeyDigest` mismatch/absence — subject to responsibility confirmation (step 9) before penalty.
 - Bootstrapping claim past `BOOTSTRAP_CLAIM_GRACE_PERIOD` (emits `BootstrapClaimAbuse`, not `AuditFailure`).
 
 Audit trigger and target selection:
@@ -481,7 +478,7 @@ Audit trigger and target selection:
 1. Node MUST NOT schedule storage-proof audits until `BootstrapDrained(self)` is true.
 2. On the transition where `BootstrapDrained(self)` becomes true, node MUST execute one audit tick immediately.
 3. After the immediate start tick, audit scheduler runs periodically at randomized `AUDIT_TICK_INTERVAL`.
-4. Per tick, node MUST run the round-construction flow in steps 2-9 above (sample local keys, lookup closest peers, filter by `LocalRT(self)` and `RepairOpportunity`, build per-peer key sets, then choose one random peer).
+4. Per tick, node MUST run the round-construction flow in steps 2-6 above (select one eligible peer, sample local keys, filter to keys the peer is responsible for via local RT lookup, then challenge).
 5. Node MUST NOT issue storage-proof audits to peers outside the round-construction output set for that tick.
 6. If round construction yields no eligible peer, node records an idle audit tick and waits for the next tick (no forced random target).
 

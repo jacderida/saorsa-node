@@ -2,7 +2,7 @@
 //!
 //! Challenge-response for claimed holders. Anti-outsourcing protection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -55,7 +55,7 @@ pub enum AuditTickResult {
 // Main audit tick
 // ---------------------------------------------------------------------------
 
-/// Execute one audit tick (Section 15 steps 2-12).
+/// Execute one audit tick (Section 15 steps 2-9).
 ///
 /// Returns the audit result. Caller is responsible for emitting trust events.
 #[allow(clippy::implicit_hasher, clippy::too_many_lines)]
@@ -66,10 +66,32 @@ pub async fn audit_tick(
     sync_history: &HashMap<PeerId, PeerSyncRecord>,
     _bootstrap_claims: &HashMap<PeerId, Instant>,
 ) -> AuditTickResult {
-    let self_id = *p2p_node.peer_id();
     let dht = p2p_node.dht_manager();
 
-    // Step 2: Sample SeedKeys from local store.
+    // Step 2: Select one eligible peer (has RepairOpportunity) at random.
+    let eligible_peers: Vec<PeerId> = sync_history
+        .iter()
+        .filter(|(_, record)| record.has_repair_opportunity())
+        .map(|(peer, _)| *peer)
+        .collect();
+
+    if eligible_peers.is_empty() {
+        return AuditTickResult::Idle;
+    }
+
+    let (challenged_peer, nonce, challenge_id) = {
+        let mut rng = rand::thread_rng();
+        let selected = match eligible_peers.choose(&mut rng) {
+            Some(p) => *p,
+            None => return AuditTickResult::Idle,
+        };
+        let n: [u8; 32] = rng.gen();
+        let c: u64 = rng.gen();
+        (selected, n, c)
+    };
+
+    // Step 3: Sample keys from local store and keep those the peer is
+    // responsible for (appears in the close group via local RT lookup).
     let all_keys = match storage.all_keys() {
         Ok(keys) => keys,
         Err(e) => {
@@ -83,7 +105,7 @@ pub async fn audit_tick(
     }
 
     let sample_count = ReplicationConfig::audit_sample_count(all_keys.len());
-    let seed_keys: Vec<XorName> = {
+    let sampled_keys: Vec<XorName> = {
         let mut rng = rand::thread_rng();
         all_keys
             .choose_multiple(&mut rng, sample_count)
@@ -91,57 +113,22 @@ pub async fn audit_tick(
             .collect()
     };
 
-    // Step 3: For each key, find closest peers from the local routing table.
-    let mut rt_filtered: HashMap<PeerId, HashSet<XorName>> = HashMap::new();
-
-    for key in &seed_keys {
+    // Step 4: Filter to keys where the chosen peer is in the close group.
+    let mut peer_keys = Vec::new();
+    for key in &sampled_keys {
         let closest = dht
             .find_closest_nodes_local(key, config.close_group_size)
             .await;
-        for node in &closest {
-            if node.peer_id != self_id {
-                rt_filtered.entry(node.peer_id).or_default().insert(*key);
-            }
+        if closest.iter().any(|n| n.peer_id == challenged_peer) {
+            peer_keys.push(*key);
         }
     }
-
-    // Step 5: Filter by RepairOpportunity.
-    rt_filtered.retain(|peer, _| {
-        sync_history
-            .get(peer)
-            .is_some_and(PeerSyncRecord::has_repair_opportunity)
-    });
-
-    // Step 7: Remove peers with empty PeerKeySet.
-    rt_filtered.retain(|_, keys| !keys.is_empty());
-
-    if rt_filtered.is_empty() {
-        return AuditTickResult::Idle;
-    }
-
-    // Step 8: Select one peer uniformly at random.
-    let peers: Vec<PeerId> = rt_filtered.keys().copied().collect();
-    let (challenged_peer, nonce, challenge_id) = {
-        let mut rng = rand::thread_rng();
-        let selected = match peers.choose(&mut rng) {
-            Some(p) => *p,
-            None => return AuditTickResult::Idle,
-        };
-        let n: [u8; 32] = rng.gen();
-        let c: u64 = rng.gen();
-        (selected, n, c)
-    };
-
-    let peer_keys: Vec<XorName> = rt_filtered
-        .get(&challenged_peer)
-        .map(|ks| ks.iter().copied().collect())
-        .unwrap_or_default();
 
     if peer_keys.is_empty() {
         return AuditTickResult::Idle;
     }
 
-    // Step 9: Send challenge.
+    // Step 6: Send challenge.
 
     let challenge = AuditChallenge {
         challenge_id,
@@ -187,7 +174,7 @@ pub async fn audit_tick(
         }
     };
 
-    // Step 10: Parse response.
+    // Step 7: Parse response.
     let resp_msg = match ReplicationMessage::decode(&response.data) {
         Ok(m) => m,
         Err(e) => {
@@ -205,7 +192,7 @@ pub async fn audit_tick(
 
     match resp_msg.body {
         ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { .. }) => {
-            // Step 10b: Bootstrapping claim.
+            // Step 7b: Bootstrapping claim.
             AuditTickResult::BootstrapClaim {
                 peer: challenged_peer,
             }
@@ -241,7 +228,7 @@ pub async fn audit_tick(
 // Digest verification
 // ---------------------------------------------------------------------------
 
-/// Verify per-key digests from audit response (Step 11).
+/// Verify per-key digests from audit response (Step 8).
 #[allow(clippy::too_many_arguments)]
 async fn verify_digests(
     challenged_peer: &PeerId,
@@ -317,7 +304,7 @@ async fn verify_digests(
         };
     }
 
-    // Step 12: Responsibility confirmation for failed keys.
+    // Step 9: Responsibility confirmation for failed keys.
     handle_audit_failure(
         challenged_peer,
         challenge_id,
@@ -333,7 +320,7 @@ async fn verify_digests(
 // Failure handling with responsibility confirmation
 // ---------------------------------------------------------------------------
 
-/// Handle audit failure: confirm responsibility before emitting evidence (Step 12).
+/// Handle audit failure: confirm responsibility before emitting evidence (Step 9).
 async fn handle_audit_failure(
     challenged_peer: &PeerId,
     challenge_id: u64,
@@ -345,7 +332,7 @@ async fn handle_audit_failure(
     let dht = p2p_node.dht_manager();
     let mut confirmed_failures = Vec::new();
 
-    // Step 12a-b: Fresh local RT lookup for each failed key.
+    // Step 9a-b: Fresh local RT lookup for each failed key.
     for key in failed_keys {
         let closest = dht
             .find_closest_nodes_local(key, config.close_group_size)
@@ -360,7 +347,7 @@ async fn handle_audit_failure(
         }
     }
 
-    // Step 12c: Empty confirmed set -> discard entirely.
+    // Step 9c: Empty confirmed set -> discard entirely.
     if confirmed_failures.is_empty() {
         info!("Audit: all failures for {challenged_peer} cleared by responsibility confirmation");
         return AuditTickResult::Passed {
@@ -369,7 +356,7 @@ async fn handle_audit_failure(
         };
     }
 
-    // Step 12d: Non-empty confirmed set -> emit evidence.
+    // Step 9d: Non-empty confirmed set -> emit evidence.
     let evidence = FailureEvidence::AuditFailure {
         challenge_id,
         challenged_peer: *challenged_peer,
