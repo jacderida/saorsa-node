@@ -9,7 +9,7 @@
 //! ┌─────────────────────────────────────────────────────────┐
 //! │                    AntProtocol                        │
 //! ├─────────────────────────────────────────────────────────┤
-//! │  protocol_id() = "autonomi/ant/chunk/v1"                  │
+//! │  protocol_id() = "autonomi.ant.chunk.v1"                  │
 //! │                                                         │
 //! │  try_handle_request(data) ──▶ decode ChunkMessage  │
 //! │                                   │                     │

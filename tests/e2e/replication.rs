@@ -15,9 +15,29 @@ use ant_node::replication::protocol::{
 };
 use ant_node::replication::scheduling::ReplicationQueues;
 use saorsa_core::identity::PeerId;
-use saorsa_core::TrustEvent;
+use saorsa_core::{P2PNode, TrustEvent};
 use serial_test::serial;
 use std::time::Duration;
+
+/// Send a replication request via saorsa-core's request-response mechanism
+/// and decode the response.
+///
+/// Uses `send_request` which wraps the payload in a `RequestResponseEnvelope`
+/// with the `/rr/` topic prefix. The replication handler recognises this
+/// pattern and routes the response back via `send_response`.
+async fn send_replication_request(
+    sender: &P2PNode,
+    target: &PeerId,
+    msg: ReplicationMessage,
+    timeout: Duration,
+) -> ReplicationMessage {
+    let encoded = msg.encode().expect("encode replication request");
+    let response = sender
+        .send_request(target, REPLICATION_PROTOCOL_ID, encoded, timeout)
+        .await
+        .expect("send_request");
+    ReplicationMessage::decode(&response.data).expect("decode replication response")
+}
 
 /// Fresh write happy path (Section 18 #1).
 ///
@@ -83,19 +103,33 @@ async fn test_fresh_replication_propagates_to_close_group() {
 #[tokio::test]
 #[serial]
 async fn test_paid_list_persistence() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
+    let mut harness = TestHarness::setup_minimal().await.expect("setup");
 
-    let node = harness.test_node(3).expect("node");
     let key = [0xAA; 32];
+    let data_dir = {
+        let node = harness.test_node(3).expect("node");
+        let dir = node.data_dir.clone();
 
-    // Insert into paid list
-    if let Some(ref engine) = node.replication_engine {
-        engine.paid_list().insert(&key).await.expect("insert");
-        assert!(engine.paid_list().contains(&key).expect("contains"));
+        // Insert into paid list
+        if let Some(ref engine) = node.replication_engine {
+            engine.paid_list().insert(&key).await.expect("insert");
+            assert!(engine.paid_list().contains(&key).expect("contains"));
+        }
+        dir
+    };
+
+    // Shut down the replication engine so the LMDB env is released
+    {
+        let node = harness.network_mut().node_mut(3).expect("node");
+        if let Some(ref mut engine) = node.replication_engine {
+            engine.shutdown().await;
+        }
+        node.replication_engine = None;
+        node.replication_shutdown = None;
     }
 
     // Reopen the paid list from the same directory to verify persistence
-    let paid_list2 = ant_node::replication::paid_list::PaidList::new(&node.data_dir)
+    let paid_list2 = ant_node::replication::paid_list::PaidList::new(&data_dir)
         .await
         .expect("reopen");
     assert!(paid_list2.contains(&key).expect("contains after reopen"));
@@ -136,22 +170,11 @@ async fn test_verification_request_returns_presence() {
         request_id: 42,
         body: ReplicationMessageBody::VerificationRequest(request),
     };
-    let encoded = msg.encode().expect("encode");
 
     let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
     let peer_a = *p2p_a.peer_id();
 
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send_request");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
         assert_eq!(resp.results.len(), 2);
         assert!(resp.results[0].present, "First key should be present");
@@ -193,22 +216,11 @@ async fn test_fetch_request_returns_record() {
         request_id: 99,
         body: ReplicationMessageBody::FetchRequest(request),
     };
-    let encoded = msg.encode().expect("encode");
 
     let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
     let peer_a = *p2p_a.peer_id();
 
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send_request");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     if let ReplicationMessageBody::FetchResponse(FetchResponse::Success { key, data }) =
         resp_msg.body
     {
@@ -259,20 +271,9 @@ async fn test_audit_challenge_returns_correct_digest() {
         request_id: 1234,
         body: ReplicationMessageBody::AuditChallenge(challenge),
     };
-    let encoded = msg.encode().expect("encode");
 
     let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send_request");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     if let ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
         challenge_id,
         digests,
@@ -320,20 +321,9 @@ async fn test_audit_absent_key_returns_sentinel() {
         request_id: 5678,
         body: ReplicationMessageBody::AuditChallenge(challenge),
     };
-    let encoded = msg.encode().expect("encode");
 
     let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send_request");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     if let ReplicationMessageBody::AuditResponse(AuditResponse::Digests { digests, .. }) =
         resp_msg.body
     {
@@ -370,20 +360,9 @@ async fn test_fetch_not_found() {
         request_id: 77,
         body: ReplicationMessageBody::FetchRequest(request),
     };
-    let encoded = msg.encode().expect("encode");
 
     let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send_request");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     assert!(
         matches!(
             resp_msg.body,
@@ -437,21 +416,10 @@ async fn test_verification_with_paid_list_check() {
         request_id: 55,
         body: ReplicationMessageBody::VerificationRequest(request),
     };
-    let encoded = msg.encode().expect("encode");
 
     let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
     let peer_a = *p2p_a.peer_id();
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send_request");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
         assert_eq!(resp.results.len(), 1);
         assert!(resp.results[0].present, "Key should be present");
@@ -495,19 +463,8 @@ async fn test_fresh_offer_with_empty_pop_rejected() {
         request_id: 1000,
         body: ReplicationMessageBody::FreshReplicationOffer(offer),
     };
-    let encoded = msg.encode().expect("encode");
 
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send_request");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     match resp_msg.body {
         ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
             reason,
@@ -566,19 +523,8 @@ async fn test_neighbor_sync_request_returns_hints() {
         request_id: 2000,
         body: ReplicationMessageBody::NeighborSyncRequest(request),
     };
-    let encoded = msg.encode().expect("encode");
 
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send_request");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     match resp_msg.body {
         ReplicationMessageBody::NeighborSyncResponse(resp) => {
             // Node A should return a sync response (may or may not contain hints
@@ -630,20 +576,9 @@ async fn test_audit_challenge_multi_key() {
         request_id: 3000,
         body: ReplicationMessageBody::AuditChallenge(challenge),
     };
-    let encoded = msg.encode().expect("encode");
 
     let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send_request");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     if let ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
         challenge_id,
         digests,
@@ -694,20 +629,8 @@ async fn test_fetch_returns_error_for_corrupt_key() {
         request_id: 4000,
         body: ReplicationMessageBody::FetchRequest(request),
     };
-    let encoded = msg.encode().expect("encode");
-
     let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send_request");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     assert!(
         matches!(
             resp_msg.body,
@@ -1084,19 +1007,8 @@ async fn scenario_17_admission_requires_sender_in_rt() {
         request_id: 1700,
         body: ReplicationMessageBody::NeighborSyncRequest(request),
     };
-    let encoded = msg.encode().expect("encode");
 
-    let response = p2p_b
-        .send_request(
-            &peer_a,
-            ant_node::replication::config::REPLICATION_PROTOCOL_ID,
-            encoded,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("send");
-
-    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
     // Response should be a valid NeighborSyncResponse regardless of RT membership
     assert!(
         matches!(
@@ -1155,23 +1067,11 @@ async fn scenario_21_paid_list_majority_from_multiple_peers() {
             request_id: 2100 + idx as u64,
             body: ReplicationMessageBody::VerificationRequest(request),
         };
-        let encoded = msg.encode().expect("encode");
 
-        if let Ok(response) = p2p_q
-            .send_request(
-                &peer,
-                ant_node::replication::config::REPLICATION_PROTOCOL_ID,
-                encoded,
-                Duration::from_secs(10),
-            )
-            .await
-        {
-            if let Ok(resp_msg) = ReplicationMessage::decode(&response.data) {
-                if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
-                    if resp.results.first().and_then(|r| r.paid) == Some(true) {
-                        paid_confirmations += 1;
-                    }
-                }
+        let resp_msg = send_replication_request(p2p_q, &peer, msg, Duration::from_secs(10)).await;
+        if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
+            if resp.results.first().and_then(|r| r.paid) == Some(true) {
+                paid_confirmations += 1;
             }
         }
     }
@@ -1286,23 +1186,11 @@ async fn scenario_25_paid_list_convergence_via_verification() {
             request_id: 2500 + idx as u64,
             body: ReplicationMessageBody::VerificationRequest(request),
         };
-        let encoded = msg.encode().expect("encode");
 
-        if let Ok(resp) = p2p_q
-            .send_request(
-                &peer,
-                ant_node::replication::config::REPLICATION_PROTOCOL_ID,
-                encoded,
-                Duration::from_secs(10),
-            )
-            .await
-        {
-            if let Ok(resp_msg) = ReplicationMessage::decode(&resp.data) {
-                if let ReplicationMessageBody::VerificationResponse(v) = resp_msg.body {
-                    if v.results.first().and_then(|r| r.paid) == Some(true) {
-                        confirmations += 1;
-                    }
-                }
+        let resp_msg = send_replication_request(p2p_q, &peer, msg, Duration::from_secs(10)).await;
+        if let ReplicationMessageBody::VerificationResponse(v) = resp_msg.body {
+            if v.results.first().and_then(|r| r.paid) == Some(true) {
+                confirmations += 1;
             }
         }
     }
@@ -1325,18 +1213,32 @@ async fn scenario_25_paid_list_convergence_via_verification() {
 #[tokio::test]
 #[serial]
 async fn scenario_44_paid_list_survives_restart() {
-    let harness = TestHarness::setup_minimal().await.expect("setup");
+    let mut harness = TestHarness::setup_minimal().await.expect("setup");
 
-    let node = harness.test_node(3).expect("node");
-    let data_dir = node.data_dir.clone();
-    let key = [0x44; 32];
+    let data_dir = {
+        let node = harness.test_node(3).expect("node");
+        let dir = node.data_dir.clone();
+        let key = [0x44; 32];
 
-    // Insert into paid list
-    if let Some(ref engine) = node.replication_engine {
-        engine.paid_list().insert(&key).await.expect("insert");
+        // Insert into paid list
+        if let Some(ref engine) = node.replication_engine {
+            engine.paid_list().insert(&key).await.expect("insert");
+        }
+        dir
+    };
+
+    // Shut down the replication engine so the LMDB env is released
+    {
+        let node = harness.network_mut().node_mut(3).expect("node");
+        if let Some(ref mut engine) = node.replication_engine {
+            engine.shutdown().await;
+        }
+        node.replication_engine = None;
+        node.replication_shutdown = None;
     }
 
     // Simulate restart: reopen PaidList from same directory
+    let key = [0x44; 32];
     let paid_list2 = ant_node::replication::paid_list::PaidList::new(&data_dir)
         .await
         .expect("reopen");

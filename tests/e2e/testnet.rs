@@ -419,12 +419,13 @@ impl TestNode {
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("Shutting down test node {}", self.index);
 
-        // Cancel replication engine first (signals all background tasks to stop)
-        if let Some(shutdown) = self.replication_shutdown.take() {
-            shutdown.cancel();
+        // Shut down replication engine and await its background tasks so all
+        // Arc<LmdbStorage> clones are released before we drop the engine.
+        if let Some(ref mut engine) = self.replication_engine {
+            engine.shutdown().await;
         }
-        // Drop the engine so its task handles are released
         self.replication_engine = None;
+        self.replication_shutdown = None;
 
         // Stop protocol handler
         if let Some(handle) = self.protocol_task.take() {
@@ -1449,11 +1450,11 @@ impl TestNetwork {
             }
 
             debug!("Stopping node {}", node.index);
-            // Cancel replication engine before tearing down P2P
-            if let Some(shutdown) = node.replication_shutdown.take() {
-                shutdown.cancel();
+            if let Some(ref mut engine) = node.replication_engine {
+                engine.shutdown().await;
             }
             node.replication_engine = None;
+            node.replication_shutdown = None;
             if let Some(handle) = node.protocol_task.take() {
                 handle.abort();
             }

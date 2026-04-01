@@ -108,7 +108,7 @@ const PRUNE_HYSTERESIS_DURATION_SECS: u64 = 6 * 60 * 60; // 6 h
 pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTERESIS_DURATION_SECS);
 
 /// Protocol identifier for replication operations.
-pub const REPLICATION_PROTOCOL_ID: &str = "autonomi/ant/replication/v1";
+pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v1";
 
 /// 10 MiB — maximum replication wire message size (accommodates hint batches).
 const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;

@@ -63,6 +63,9 @@ use saorsa_core::{P2PEvent, P2PNode, TrustEvent};
 // Constants
 // ---------------------------------------------------------------------------
 
+/// Prefix used by saorsa-core's request-response mechanism.
+const RR_PREFIX: &str = "/rr/";
+
 /// Fetch worker polling interval in milliseconds.
 const FETCH_WORKER_POLL_MS: u64 = 100;
 
@@ -179,6 +182,18 @@ impl ReplicationEngine {
         );
     }
 
+    /// Cancel all background tasks and wait for them to terminate.
+    ///
+    /// This must be awaited before dropping the engine when the caller needs
+    /// the `Arc<LmdbStorage>` references held by background tasks to be
+    /// released (e.g. before reopening the same LMDB environment).
+    pub async fn shutdown(&mut self) {
+        self.shutdown.cancel();
+        for handle in self.task_handles.drain(..) {
+            let _ = handle.await;
+        }
+    }
+
     /// Execute fresh replication for a newly stored record.
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
         fresh::replicate_fresh(
@@ -196,6 +211,7 @@ impl ReplicationEngine {
     // Background task launchers
     // =======================================================================
 
+    #[allow(clippy::too_many_lines)]
     fn start_message_handler(&mut self) {
         let mut events = self.p2p_node.subscribe_events();
         let p2p = Arc::clone(&self.p2p_node);
@@ -222,10 +238,24 @@ impl ReplicationEngine {
                                 source: Some(source),
                                 data,
                             } => {
-                                if topic == REPLICATION_PROTOCOL_ID {
-                                    if let Err(e) = handle_replication_message(
+                                // Determine if this is a replication message
+                                // and whether it arrived via the /rr/ request-response
+                                // path (which wraps payloads in RequestResponseEnvelope).
+                                let rr_info = if topic == REPLICATION_PROTOCOL_ID {
+                                    Some((data.clone(), None))
+                                } else if topic.starts_with(RR_PREFIX)
+                                    && &topic[RR_PREFIX.len()..] == REPLICATION_PROTOCOL_ID
+                                {
+                                    P2PNode::parse_request_envelope(&data)
+                                        .filter(|(_, is_resp, _)| !is_resp)
+                                        .map(|(msg_id, _, payload)| (payload, Some(msg_id)))
+                                } else {
+                                    None
+                                };
+                                if let Some((payload, rr_message_id)) = rr_info {
+                                    match handle_replication_message(
                                         &source,
-                                        &data,
+                                        &payload,
                                         &p2p,
                                         &storage,
                                         &paid_list,
@@ -235,10 +265,14 @@ impl ReplicationEngine {
                                         &is_bootstrapping,
                                         &sync_state,
                                         &sync_history,
+                                        rr_message_id.as_deref(),
                                     ).await {
-                                        debug!(
-                                            "Replication message from {source} error: {e}"
-                                        );
+                                        Ok(()) => {}
+                                        Err(e) => {
+                                            debug!(
+                                                "Replication message from {source} error: {e}"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -582,6 +616,10 @@ impl ReplicationEngine {
 // ===========================================================================
 
 /// Handle an incoming replication protocol message.
+///
+/// When `rr_message_id` is `Some`, the request arrived via the `/rr/`
+/// request-response path and the response must be sent via `send_response`
+/// so saorsa-core can route it back to the waiting `send_request` caller.
 #[allow(clippy::too_many_arguments)]
 async fn handle_replication_message(
     source: &PeerId,
@@ -595,6 +633,7 @@ async fn handle_replication_message(
     is_bootstrapping: &Arc<RwLock<bool>>,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    rr_message_id: Option<&str>,
 ) -> Result<()> {
     let msg = ReplicationMessage::decode(data)
         .map_err(|e| Error::Protocol(format!("Failed to decode replication message: {e}")))?;
@@ -610,6 +649,7 @@ async fn handle_replication_message(
                 p2p_node,
                 config,
                 msg.request_id,
+                rr_message_id,
             )
             .await
         }
@@ -638,6 +678,7 @@ async fn handle_replication_message(
                 sync_state,
                 sync_history,
                 msg.request_id,
+                rr_message_id,
             )
             .await
         }
@@ -649,11 +690,20 @@ async fn handle_replication_message(
                 paid_list,
                 p2p_node,
                 msg.request_id,
+                rr_message_id,
             )
             .await
         }
         ReplicationMessageBody::FetchRequest(ref request) => {
-            handle_fetch_request(source, request, storage, p2p_node, msg.request_id).await
+            handle_fetch_request(
+                source,
+                request,
+                storage,
+                p2p_node,
+                msg.request_id,
+                rr_message_id,
+            )
+            .await
         }
         ReplicationMessageBody::AuditChallenge(ref challenge) => {
             let bootstrapping = *is_bootstrapping.read().await;
@@ -664,6 +714,7 @@ async fn handle_replication_message(
                 p2p_node,
                 bootstrapping,
                 msg.request_id,
+                rr_message_id,
             )
             .await
         }
@@ -690,6 +741,7 @@ async fn handle_fresh_offer(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     request_id: u64,
+    rr_message_id: Option<&str>,
 ) -> Result<()> {
     let self_id = *p2p_node.peer_id();
 
@@ -703,6 +755,7 @@ async fn handle_fresh_offer(
                 key: offer.key,
                 reason: "Missing proof of payment".to_string(),
             }),
+            rr_message_id,
         )
         .await;
         return Ok(());
@@ -718,6 +771,7 @@ async fn handle_fresh_offer(
                 key: offer.key,
                 reason: "Not responsible for this key".to_string(),
             }),
+            rr_message_id,
         )
         .await;
         return Ok(());
@@ -745,6 +799,7 @@ async fn handle_fresh_offer(
                         reason: "Payment verification failed: payment required".to_string(),
                     },
                 ),
+                rr_message_id,
             )
             .await;
             return Ok(());
@@ -764,6 +819,7 @@ async fn handle_fresh_offer(
                         reason: format!("Payment verification error: {e}"),
                     },
                 ),
+                rr_message_id,
             )
             .await;
             return Ok(());
@@ -785,6 +841,7 @@ async fn handle_fresh_offer(
                 ReplicationMessageBody::FreshReplicationResponse(
                     FreshReplicationResponse::Accepted { key: offer.key },
                 ),
+                rr_message_id,
             )
             .await;
         }
@@ -799,6 +856,7 @@ async fn handle_fresh_offer(
                         reason: format!("Storage error: {e}"),
                     },
                 ),
+                rr_message_id,
             )
             .await;
         }
@@ -881,6 +939,7 @@ async fn handle_neighbor_sync_request(
     _sync_state: &Arc<RwLock<NeighborSyncState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     request_id: u64,
+    rr_message_id: Option<&str>,
 ) -> Result<()> {
     let self_id = *p2p_node.peer_id();
 
@@ -902,6 +961,7 @@ async fn handle_neighbor_sync_request(
         p2p_node,
         request_id,
         ReplicationMessageBody::NeighborSyncResponse(response),
+        rr_message_id,
     )
     .await;
 
@@ -983,6 +1043,7 @@ async fn handle_verification_request(
     paid_list: &Arc<PaidList>,
     p2p_node: &Arc<P2PNode>,
     request_id: u64,
+    rr_message_id: Option<&str>,
 ) -> Result<()> {
     let paid_check_set: HashSet<u16> = request.paid_list_check_indices.iter().copied().collect();
 
@@ -1006,6 +1067,7 @@ async fn handle_verification_request(
         p2p_node,
         request_id,
         ReplicationMessageBody::VerificationResponse(VerificationResponse { results }),
+        rr_message_id,
     )
     .await;
 
@@ -1018,6 +1080,7 @@ async fn handle_fetch_request(
     storage: &Arc<LmdbStorage>,
     p2p_node: &Arc<P2PNode>,
     request_id: u64,
+    rr_message_id: Option<&str>,
 ) -> Result<()> {
     let response = match storage.get(&request.key).await {
         Ok(Some(data)) => protocol::FetchResponse::Success {
@@ -1036,6 +1099,7 @@ async fn handle_fetch_request(
         p2p_node,
         request_id,
         ReplicationMessageBody::FetchResponse(response),
+        rr_message_id,
     )
     .await;
 
@@ -1049,6 +1113,7 @@ async fn handle_audit_challenge_msg(
     p2p_node: &Arc<P2PNode>,
     is_bootstrapping: bool,
     request_id: u64,
+    rr_message_id: Option<&str>,
 ) -> Result<()> {
     let response = audit::handle_audit_challenge(challenge, storage, is_bootstrapping);
 
@@ -1057,6 +1122,7 @@ async fn handle_audit_challenge_msg(
         p2p_node,
         request_id,
         ReplicationMessageBody::AuditResponse(response),
+        rr_message_id,
     )
     .await;
 
@@ -1069,11 +1135,16 @@ async fn handle_audit_challenge_msg(
 
 /// Send a replication response message. Fire-and-forget: logs errors but
 /// does not propagate them.
+///
+/// When `rr_message_id` is `Some`, the response is sent via the `/rr/`
+/// request-response path so saorsa-core can route it back to the caller's
+/// `send_request` future. Otherwise it is sent as a plain message.
 async fn send_replication_response(
     peer: &PeerId,
     p2p_node: &Arc<P2PNode>,
     request_id: u64,
     body: ReplicationMessageBody,
+    rr_message_id: Option<&str>,
 ) {
     let msg = ReplicationMessage { request_id, body };
     let encoded = match msg.encode() {
@@ -1083,10 +1154,16 @@ async fn send_replication_response(
             return;
         }
     };
-    if let Err(e) = p2p_node
-        .send_message(peer, REPLICATION_PROTOCOL_ID, encoded, &[])
-        .await
-    {
+    let result = if let Some(msg_id) = rr_message_id {
+        p2p_node
+            .send_response(peer, REPLICATION_PROTOCOL_ID, msg_id, encoded)
+            .await
+    } else {
+        p2p_node
+            .send_message(peer, REPLICATION_PROTOCOL_ID, encoded, &[])
+            .await
+    };
+    if let Err(e) = result {
         debug!("Failed to send replication response to {peer}: {e}");
     }
 }
