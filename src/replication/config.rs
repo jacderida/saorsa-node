@@ -88,9 +88,6 @@ pub const AUDIT_TICK_INTERVAL_MIN: Duration = Duration::from_secs(AUDIT_TICK_INT
 /// Audit scheduler cadence range (max).
 pub const AUDIT_TICK_INTERVAL_MAX: Duration = Duration::from_secs(AUDIT_TICK_INTERVAL_MAX_SECS);
 
-/// Maximum local keys sampled per audit round (also max challenge items).
-pub const AUDIT_BATCH_SIZE: usize = 8;
-
 /// Audit response deadline.
 const AUDIT_RESPONSE_TIMEOUT_SECS: u64 = 12;
 /// Audit response deadline.
@@ -168,8 +165,6 @@ pub struct ReplicationConfig {
     pub audit_tick_interval_min: Duration,
     /// Audit scheduler cadence range (max).
     pub audit_tick_interval_max: Duration,
-    /// Maximum local keys sampled per audit round.
-    pub audit_batch_size: usize,
     /// Audit response deadline.
     pub audit_response_timeout: Duration,
     /// Maximum duration a peer may claim bootstrap status.
@@ -201,7 +196,6 @@ impl Default for ReplicationConfig {
             max_parallel_fetch_bootstrap: MAX_PARALLEL_FETCH_BOOTSTRAP,
             audit_tick_interval_min: AUDIT_TICK_INTERVAL_MIN,
             audit_tick_interval_max: AUDIT_TICK_INTERVAL_MAX,
-            audit_batch_size: AUDIT_BATCH_SIZE,
             audit_response_timeout: AUDIT_RESPONSE_TIMEOUT,
             bootstrap_claim_grace_period: BOOTSTRAP_CLAIM_GRACE_PERIOD,
             prune_hysteresis_duration: PRUNE_HYSTERESIS_DURATION,
@@ -254,9 +248,6 @@ impl ReplicationConfig {
         if self.neighbor_sync_peer_count == 0 {
             return Err("neighbor_sync_peer_count must be >= 1".to_string());
         }
-        if self.audit_batch_size == 0 {
-            return Err("audit_batch_size must be >= 1".to_string());
-        }
         Ok(())
     }
 
@@ -287,6 +278,21 @@ impl ReplicationConfig {
             self.neighbor_sync_interval_min,
             self.neighbor_sync_interval_max,
         )
+    }
+
+    /// Compute the number of keys to sample for an audit round, scaled
+    /// dynamically by the total number of locally stored keys.
+    ///
+    /// Formula: `max(floor(sqrt(total_keys)), 1)`, capped at `total_keys`.
+    #[must_use]
+    pub fn audit_sample_count(total_keys: usize) -> usize {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let sqrt = (total_keys as f64).sqrt() as usize;
+        sqrt.max(1).min(total_keys)
     }
 
     /// Returns a random duration in `[audit_tick_interval_min,
@@ -411,12 +417,23 @@ mod tests {
     }
 
     #[test]
-    fn audit_batch_size_zero_rejected() {
-        let config = ReplicationConfig {
-            audit_batch_size: 0,
-            ..ReplicationConfig::default()
-        };
-        assert!(config.validate().is_err());
+    fn audit_sample_count_scales_with_sqrt() {
+        // Empty store
+        assert_eq!(ReplicationConfig::audit_sample_count(0), 0);
+
+        // Single key
+        assert_eq!(ReplicationConfig::audit_sample_count(1), 1);
+
+        // Small stores: sqrt(3)=1
+        assert_eq!(ReplicationConfig::audit_sample_count(3), 1);
+
+        // sqrt scaling
+        assert_eq!(ReplicationConfig::audit_sample_count(4), 2);
+        assert_eq!(ReplicationConfig::audit_sample_count(25), 5);
+        assert_eq!(ReplicationConfig::audit_sample_count(100), 10);
+        assert_eq!(ReplicationConfig::audit_sample_count(1_000), 31);
+        assert_eq!(ReplicationConfig::audit_sample_count(10_000), 100);
+        assert_eq!(ReplicationConfig::audit_sample_count(1_000_000), 1_000);
     }
 
     #[test]

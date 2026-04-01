@@ -70,7 +70,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `SELF_LOOKUP_INTERVAL` | Periodic self-lookup cadence to keep close neighborhood current | random in `[5 min, 10 min]`         |
 | `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20`                                |
 | `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[30 min, 1 hour]`        |
-| `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8`                                 |
+| *(dynamic)* | Audit sample count per round: `floor(sqrt(local_key_count))` | scales with store size |
 | `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `12s`                               |
 | `BOOTSTRAP_CLAIM_GRACE_PERIOD` | Max duration a peer may claim bootstrap status before penalties apply | `24h`                               |
 | `PRUNE_HYSTERESIS_DURATION` | Minimum continuous out-of-range duration before pruning a key | `6h`                                |
@@ -439,7 +439,7 @@ Rules:
 Challenge-response for claimed holders:
 
 1. Challenger creates unique challenge id + nonce.
-2. Challenger samples `SeedKeys` uniformly at random from locally stored record keys, with `|SeedKeys| = min(AUDIT_BATCH_SIZE, local_store_key_count)`. If local store is empty, the audit tick is idle.
+2. Challenger samples `SeedKeys` uniformly at random from locally stored record keys, with `|SeedKeys| = max(floor(sqrt(local_store_key_count)), 1)` (capped at `local_store_key_count`). If local store is empty, the audit tick is idle.
 3. For each `K` in `SeedKeys`, challenger performs one network closest-peer lookup and records the returned closest-peer set for `K`.
 4. Challenger builds `CandidatePeers` as the union of returned peers across all sampled keys, then filters to `CandidatePeersRT = CandidatePeers ∩ LocalRT(self)`.
 5. Challenger removes peers from `CandidatePeersRT` for which `RepairOpportunity(P, _)` is false — that is, peers that have never been synced with or have not had at least one subsequent neighbor-sync cycle to repair. Auditing such peers wastes network resources on challenges they cannot pass.
@@ -468,8 +468,8 @@ Audit-proof requirements:
 
 Audit challenge bound:
 
-- Challenge size is dynamic per selected peer: `1 <= |PeerKeySet(challenged_peer_id)| <= AUDIT_BATCH_SIZE` when a challenge is issued.
-- Worst-case challenge bytes are bounded because each record is max `4 MiB` (`<= AUDIT_BATCH_SIZE * 4 MiB`).
+- Challenge size is dynamic per selected peer: `1 <= |PeerKeySet(challenged_peer_id)| <= floor(sqrt(local_store_key_count))` when a challenge is issued.
+- Worst-case challenge bytes are bounded because each record is max `4 MiB` (`<= floor(sqrt(local_store_key_count)) * 4 MiB`).
 
 Failure conditions:
 
@@ -596,7 +596,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 29. Audit start gate:
 - Node does not schedule audits before `BootstrapDrained(self)`; first audit tick fires immediately when `BootstrapDrained(self)` transitions to true.
 30. Audit peer selection from sampled keys:
-- Scheduler samples up to `AUDIT_BATCH_SIZE` local keys, performs closest-peer lookups, filters peers by `LocalRT(self)`, builds `PeerKeySet` from those lookup results only, and selects one random peer to audit.
+- Scheduler samples `floor(sqrt(total_keys))` local keys (minimum 1), performs closest-peer lookups, filters peers by `LocalRT(self)`, builds `PeerKeySet` from those lookup results only, and selects one random peer to audit.
 31. Audit periodic cadence with jitter:
 - Consecutive audit ticks occur on randomized intervals bounded by configured `AUDIT_TICK_INTERVAL` window.
 32. Dynamic challenge size:

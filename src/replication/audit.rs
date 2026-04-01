@@ -82,7 +82,7 @@ pub async fn audit_tick(
         return AuditTickResult::Idle;
     }
 
-    let sample_count = config.audit_batch_size.min(all_keys.len());
+    let sample_count = ReplicationConfig::audit_sample_count(all_keys.len());
     let seed_keys: Vec<XorName> = {
         let mut rng = rand::thread_rng();
         all_keys
@@ -1091,30 +1091,28 @@ mod tests {
 
     // -- Scenario 30: Audit peer selection from sampled keys --------------------
 
-    /// Scenario 30: Key sampling respects `audit_batch_size` and
+    /// Scenario 30: Key sampling uses dynamic sqrt-based batch sizing and
     /// `RepairOpportunity` filtering excludes never-synced peers.
     ///
     /// Full `audit_tick` requires a live network.  This test verifies the two
     /// deterministic sub-steps the function relies on:
-    ///   (a) `audit_batch_size.min(all_keys.len())` caps the sample count.
+    ///   (a) `audit_sample_count` scales with `sqrt(total_keys)`.
     ///   (b) `PeerSyncRecord::has_repair_opportunity` gates peer eligibility.
     #[test]
     fn scenario_30_audit_peer_selection_from_sampled_keys() {
-        let config = ReplicationConfig::default(); // audit_batch_size = 8
-
-        // (a) Sample count is capped at audit_batch_size.
-        let many_keys = 100usize;
+        // (a) Dynamic sample count scales with sqrt(total_keys).
         assert_eq!(
-            config.audit_batch_size.min(many_keys),
-            config.audit_batch_size,
-            "sample count should be capped at audit_batch_size when local store is larger"
+            ReplicationConfig::audit_sample_count(100),
+            10,
+            "sample count should scale with sqrt(total_keys)"
         );
 
-        let few_keys = 3usize;
+        assert_eq!(ReplicationConfig::audit_sample_count(3), 1, "sqrt(3) = 1");
+
         assert_eq!(
-            config.audit_batch_size.min(few_keys),
-            few_keys,
-            "sample count should equal key count when store is smaller than batch size"
+            ReplicationConfig::audit_sample_count(10_000),
+            100,
+            "sqrt(10000) = 100"
         );
 
         // (b) Peer eligibility via RepairOpportunity.
