@@ -58,6 +58,10 @@ pub enum AuditTickResult {
 /// Execute one audit tick (Section 15 steps 2-9).
 ///
 /// Returns the audit result. Caller is responsible for emitting trust events.
+///
+/// **Invariant 19**: Returns [`AuditTickResult::Idle`] immediately if
+/// `is_bootstrapping` is `true` — a node must not audit others while it
+/// is still bootstrapping.
 #[allow(clippy::implicit_hasher, clippy::too_many_lines)]
 pub async fn audit_tick(
     p2p_node: &Arc<P2PNode>,
@@ -65,7 +69,13 @@ pub async fn audit_tick(
     config: &ReplicationConfig,
     sync_history: &HashMap<PeerId, PeerSyncRecord>,
     bootstrap_claims: &HashMap<PeerId, Instant>,
+    is_bootstrapping: bool,
 ) -> AuditTickResult {
+    // Invariant 19: never audit while still bootstrapping.
+    if is_bootstrapping {
+        return AuditTickResult::Idle;
+    }
+
     let dht = p2p_node.dht_manager();
     let now = Instant::now();
 
@@ -1109,8 +1119,9 @@ mod tests {
     /// `AuditFailure` evidence is emitted by the caller.
     ///
     /// This is the responder-side gate.  The challenger-side gate is enforced
-    /// by `check_bootstrap_drained()` in the engine loop (tested in
-    /// `bootstrap.rs`); this test confirms the complementary responder behavior.
+    /// by `audit_tick`'s `is_bootstrapping` guard (Invariant 19) and by
+    /// `check_bootstrap_drained()` in the engine loop; this test confirms the
+    /// complementary responder behavior.
     #[tokio::test]
     async fn scenario_29_audit_start_gate_during_bootstrap() {
         let (storage, _temp) = create_test_storage().await;

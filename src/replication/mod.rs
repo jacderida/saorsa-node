@@ -384,6 +384,7 @@ impl ReplicationEngine {
         let shutdown = self.shutdown.clone();
         let sync_history = Arc::clone(&self.sync_history);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let sync_state = Arc::clone(&self.sync_state);
 
         let handle = tokio::spawn(async move {
@@ -403,11 +404,19 @@ impl ReplicationEngine {
 
             // Run one audit tick immediately after bootstrap drain.
             {
+                let bootstrapping = *is_bootstrapping.read().await;
                 let result = {
                     let history = sync_history.read().await;
                     let claims = sync_state.read().await;
-                    audit::audit_tick(&p2p, &storage, &config, &history, &claims.bootstrap_claims)
-                        .await
+                    audit::audit_tick(
+                        &p2p,
+                        &storage,
+                        &config,
+                        &history,
+                        &claims.bootstrap_claims,
+                        bootstrapping,
+                    )
+                    .await
                 };
                 handle_audit_result(&result, &p2p, &sync_state, &config).await;
             }
@@ -418,12 +427,14 @@ impl ReplicationEngine {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(interval) => {
+                        let bootstrapping = *is_bootstrapping.read().await;
                         let result = {
                             let history = sync_history.read().await;
                             let claims = sync_state.read().await;
                             audit::audit_tick(
                                 &p2p, &storage, &config, &history,
                                 &claims.bootstrap_claims,
+                                bootstrapping,
                             )
                             .await
                         };
