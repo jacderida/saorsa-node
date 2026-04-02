@@ -226,11 +226,14 @@ impl AntProtocol {
                 self.quote_generator.record_payment();
 
                 // 6. Notify replication engine for fresh fan-out.
-                if let Some(ref tx) = self.fresh_write_tx {
+                //    Only emit when a real proof is present — cached-as-verified
+                //    PUTs have no proof to forward, and the chunk would have
+                //    already replicated on the original write that carried one.
+                if let (Some(ref tx), Some(proof)) = (&self.fresh_write_tx, request.payment_proof) {
                     let event = FreshWriteEvent {
                         key: address,
                         data: request.content,
-                        payment_proof: request.payment_proof.unwrap_or_default(),
+                        payment_proof: proof,
                     };
                     if tx.send(event).is_err() {
                         debug!("Fresh-write channel closed, skipping replication for {addr_hex}");
