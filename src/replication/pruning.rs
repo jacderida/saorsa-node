@@ -65,7 +65,7 @@ pub async fn run_prune_pass(
 
     // -- Prune stored records ---------------------------------------------
 
-    let stored_keys = match storage.all_keys() {
+    let stored_keys = match storage.all_keys().await {
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read stored keys for pruning: {e}");

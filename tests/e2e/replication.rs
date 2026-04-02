@@ -950,7 +950,7 @@ async fn scenario_14_sync_hints_cover_all_local_keys() {
     }
 
     // Verify the local inventory is complete
-    let all_keys = storage_a.all_keys().expect("all_keys");
+    let all_keys = storage_a.all_keys().await.expect("all_keys");
     assert_eq!(
         all_keys.len(),
         addresses.len(),

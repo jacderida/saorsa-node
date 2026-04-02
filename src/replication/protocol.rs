@@ -214,7 +214,7 @@ pub struct VerificationRequest {
     pub keys: Vec<XorName>,
     /// Which keys need paid-list status in addition to presence.
     /// Each value is an index into the `keys` vector.
-    pub paid_list_check_indices: Vec<u16>,
+    pub paid_list_check_indices: Vec<u32>,
 }
 
 /// Per-key verification result from a peer.

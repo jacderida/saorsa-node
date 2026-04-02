@@ -30,7 +30,7 @@ pub async fn build_replica_hints_for_peer(
     p2p_node: &Arc<P2PNode>,
     close_group_size: usize,
 ) -> Vec<XorName> {
-    let all_keys = match storage.all_keys() {
+    let all_keys = match storage.all_keys().await {
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read stored keys for hint construction: {e}");

@@ -267,7 +267,7 @@ pub async fn run_verification_round(
         for (i, key) in peer_keys.iter().enumerate() {
             if let Some(paid_keys) = paid_check_keys {
                 if paid_keys.contains(key) {
-                    if let Ok(idx) = u16::try_from(i) {
+                    if let Ok(idx) = u32::try_from(i) {
                         paid_indices.push(idx);
                     }
                 }

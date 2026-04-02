@@ -112,6 +112,18 @@ const PRUNE_HYSTERESIS_DURATION_SECS: u64 = 6 * 60 * 60; // 6 h
 /// Minimum continuous out-of-range duration before pruning a key.
 pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTERESIS_DURATION_SECS);
 
+/// Maximum number of keys accepted in an incoming audit challenge.
+///
+/// Set to `2 * max_expected_audit_sample` to give margin for legitimate
+/// challengers with larger stores.  Challenges exceeding this are rejected
+/// as a `DoS` mitigation.
+pub const MAX_AUDIT_CHALLENGE_KEYS: usize = 2 * MAX_AUDIT_SAMPLE_ESTIMATE;
+
+/// Conservative upper-bound estimate for `audit_sample_count`.
+///
+/// `sqrt(5_000_000)` ≈ 2236 — covers a node with ~5 M small chunks.
+const MAX_AUDIT_SAMPLE_ESTIMATE: usize = 2_500;
+
 /// Protocol identifier for replication operations.
 pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v1";
 

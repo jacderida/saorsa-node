@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use tokio::task::spawn_blocking;
 use tracing::{debug, trace, warn};
 
+/// Length of an `XorName` key in bytes.
+const XORNAME_LEN: usize = 32;
+
 /// Default LMDB map size: 32 GiB.
 ///
 /// Node operators can override this via `storage.db_size_gb` in `config.toml`.
@@ -417,26 +420,33 @@ impl LmdbStorage {
     /// # Errors
     ///
     /// Returns an error if the LMDB read transaction fails.
-    pub fn all_keys(&self) -> Result<Vec<XorName>> {
-        let rtxn = self
-            .env
-            .read_txn()
-            .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
-        let mut keys = Vec::new();
-        let iter = self
-            .db
-            .iter(&rtxn)
-            .map_err(|e| Error::Storage(format!("Failed to iterate database: {e}")))?;
-        for result in iter {
-            let (key_bytes, _) =
-                result.map_err(|e| Error::Storage(format!("Failed to read entry: {e}")))?;
-            if key_bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(key_bytes);
-                keys.push(key);
+    pub async fn all_keys(&self) -> Result<Vec<XorName>> {
+        let env = self.env.clone();
+        let db = self.db;
+
+        let keys = spawn_blocking(move || -> Result<Vec<XorName>> {
+            let rtxn = env
+                .read_txn()
+                .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+            let mut keys = Vec::new();
+            let iter = db
+                .iter(&rtxn)
+                .map_err(|e| Error::Storage(format!("Failed to iterate database: {e}")))?;
+            for result in iter {
+                let (key_bytes, _) =
+                    result.map_err(|e| Error::Storage(format!("Failed to read entry: {e}")))?;
+                if key_bytes.len() == XORNAME_LEN {
+                    let mut key = [0u8; XORNAME_LEN];
+                    key.copy_from_slice(key_bytes);
+                    keys.push(key);
+                }
             }
-        }
-        Ok(keys)
+            Ok(keys)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("all_keys task panicked: {e}")))?;
+
+        keys
     }
 
     /// Retrieve raw chunk bytes without content-address verification.
@@ -447,16 +457,24 @@ impl LmdbStorage {
     /// # Errors
     ///
     /// Returns an error if the LMDB read transaction fails.
-    pub fn get_raw(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
-        let rtxn = self
-            .env
-            .read_txn()
-            .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
-        let value = self
-            .db
-            .get(&rtxn, address.as_ref())
-            .map_err(|e| Error::Storage(format!("Failed to get chunk: {e}")))?;
-        Ok(value.map(Vec::from))
+    pub async fn get_raw(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+        let key = *address;
+        let env = self.env.clone();
+        let db = self.db;
+
+        let value = spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let rtxn = env
+                .read_txn()
+                .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+            let val = db
+                .get(&rtxn, key.as_ref())
+                .map_err(|e| Error::Storage(format!("Failed to get chunk: {e}")))?;
+            Ok(val.map(Vec::from))
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("get_raw task panicked: {e}")))?;
+
+        value
     }
 }
 
@@ -700,7 +718,7 @@ mod tests {
         let (storage, _temp) = create_test_storage().await;
 
         // Empty storage
-        let keys = storage.all_keys().expect("all_keys empty");
+        let keys = storage.all_keys().await.expect("all_keys empty");
         assert!(keys.is_empty());
 
         // Store some chunks
@@ -711,7 +729,7 @@ mod tests {
         storage.put(&addr1, content1).await.expect("put 1");
         storage.put(&addr2, content2).await.expect("put 2");
 
-        let mut keys = storage.all_keys().expect("all_keys");
+        let mut keys = storage.all_keys().await.expect("all_keys");
         keys.sort_unstable();
         let mut expected = vec![addr1, addr2];
         expected.sort_unstable();
@@ -727,11 +745,11 @@ mod tests {
         storage.put(&address, content).await.expect("put");
 
         // get_raw returns bytes without verification
-        let raw = storage.get_raw(&address).expect("get_raw");
+        let raw = storage.get_raw(&address).await.expect("get_raw");
         assert_eq!(raw, Some(content.to_vec()));
 
         // Non-existent key
-        let missing = storage.get_raw(&[0xFF; 32]).expect("get_raw missing");
+        let missing = storage.get_raw(&[0xFF; 32]).await.expect("get_raw missing");
         assert!(missing.is_none());
     }
 }

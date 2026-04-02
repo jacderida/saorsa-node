@@ -120,9 +120,13 @@ impl ReplicationQueues {
 
     /// Enqueue a key for fetch with its distance and verified sources.
     ///
-    /// No-op if the key is already in the fetch queue or in-flight.
+    /// No-op if the key is already in any pipeline stage (Rule 8: cross-queue
+    /// dedup).
     pub fn enqueue_fetch(&mut self, key: XorName, distance: XorName, sources: Vec<PeerId>) {
-        if self.fetch_queue_keys.contains(&key) || self.in_flight_fetch.contains_key(&key) {
+        if self.pending_verify.contains_key(&key)
+            || self.fetch_queue_keys.contains(&key)
+            || self.in_flight_fetch.contains_key(&key)
+        {
             return;
         }
         self.fetch_queue_keys.insert(key);

@@ -1086,12 +1086,12 @@ async fn handle_verification_request(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    let paid_check_set: HashSet<u16> = request.paid_list_check_indices.iter().copied().collect();
+    let paid_check_set: HashSet<u32> = request.paid_list_check_indices.iter().copied().collect();
 
     let mut results = Vec::with_capacity(request.keys.len());
     for (i, key) in request.keys.iter().enumerate() {
         let present = storage.exists(key).unwrap_or(false);
-        let paid = if paid_check_set.contains(&u16::try_from(i).unwrap_or(u16::MAX)) {
+        let paid = if paid_check_set.contains(&u32::try_from(i).unwrap_or(u32::MAX)) {
             Some(paid_list.contains(key).unwrap_or(false))
         } else {
             None
@@ -1156,7 +1156,9 @@ async fn handle_audit_challenge_msg(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    let response = audit::handle_audit_challenge(challenge, storage, is_bootstrapping);
+    let response =
+        audit::handle_audit_challenge(challenge, storage, p2p_node.peer_id(), is_bootstrapping)
+            .await;
 
     send_replication_response(
         source,
@@ -1252,10 +1254,14 @@ async fn run_neighbor_sync_round(
             )
             .await;
 
-            // Preserve last_sync_times across cycles.
+            // Preserve last_sync_times and bootstrap_claims across cycles.
+            // Claims have a 24h lifecycle vs 10-20 min cycles — dropping them
+            // would reset the abuse detection timer every cycle.
             let old_sync_times = std::mem::take(&mut state.last_sync_times);
+            let old_bootstrap_claims = std::mem::take(&mut state.bootstrap_claims);
             *state = NeighborSyncState::new_cycle(neighbors);
             state.last_sync_times = old_sync_times;
+            state.bootstrap_claims = old_bootstrap_claims;
         }
     }
 
@@ -1469,55 +1475,62 @@ async fn run_verification_cycle(
     let evidence =
         quorum::run_verification_round(&keys_needing_network, &targets, p2p_node, config).await;
 
-    // Step 3: Evaluate results and update queues.
+    // Step 3: Evaluate results — collect outcomes without holding the write
+    // lock across paid-list I/O.
+    let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline)> = Vec::new();
+    {
+        let q = queues.read().await;
+        for key in &keys_needing_network {
+            let Some(ev) = evidence.get(key) else {
+                continue;
+            };
+            let Some(entry) = q.get_pending(key) else {
+                continue;
+            };
+            let outcome = quorum::evaluate_key_evidence(key, ev, &targets, config);
+            evaluated.push((*key, outcome, entry.pipeline));
+        }
+    } // read lock released
+
+    // Step 4: Insert verified keys into PaidForList (no lock held).
+    let mut paid_insert_keys: Vec<XorName> = Vec::new();
+    for (key, outcome, _) in &evaluated {
+        if matches!(
+            outcome,
+            KeyVerificationOutcome::QuorumVerified { .. }
+                | KeyVerificationOutcome::PaidListVerified { .. }
+        ) {
+            paid_insert_keys.push(*key);
+        }
+    }
+    for key in &paid_insert_keys {
+        if let Err(e) = paid_list.insert(key).await {
+            warn!("Failed to add verified key to PaidForList: {e}");
+        }
+    }
+
+    // Step 5: Update queues with the evaluated outcomes.
     let mut q = queues.write().await;
-    for key in &keys_needing_network {
-        let Some(ev) = evidence.get(key) else {
-            continue;
-        };
-
-        let entry = match q.get_pending(key) {
-            Some(e) => e.clone(),
-            None => continue,
-        };
-
-        let outcome = quorum::evaluate_key_evidence(key, ev, &targets, config);
-
+    for (key, outcome, pipeline) in evaluated {
         match outcome {
-            KeyVerificationOutcome::QuorumVerified { sources } => {
-                // Derived authorization: add to PaidForList.
-                if let Err(e) = paid_list.insert(key).await {
-                    warn!("Failed to add quorum-verified key to PaidForList: {e}");
-                }
-                if entry.pipeline == HintPipeline::Replica && !sources.is_empty() {
-                    let distance = crate::client::xor_distance(key, p2p_node.peer_id().as_bytes());
-                    q.remove_pending(key);
-                    q.enqueue_fetch(*key, distance, sources);
-                } else {
-                    q.remove_pending(key);
-                }
-            }
-            KeyVerificationOutcome::PaidListVerified { sources } => {
-                if let Err(e) = paid_list.insert(key).await {
-                    warn!("Failed to add paid-verified key to PaidForList: {e}");
-                }
-                if entry.pipeline == HintPipeline::Replica && !sources.is_empty() {
-                    let distance = crate::client::xor_distance(key, p2p_node.peer_id().as_bytes());
-                    q.remove_pending(key);
-                    q.enqueue_fetch(*key, distance, sources);
-                } else if entry.pipeline == HintPipeline::Replica {
+            KeyVerificationOutcome::QuorumVerified { sources }
+            | KeyVerificationOutcome::PaidListVerified { sources } => {
+                if pipeline == HintPipeline::Replica && !sources.is_empty() {
+                    let distance = crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
+                    q.remove_pending(&key);
+                    q.enqueue_fetch(key, distance, sources);
+                } else if pipeline == HintPipeline::Replica && sources.is_empty() {
                     warn!(
-                        "Paid-authorized key {} has no holders (possible data loss)",
+                        "Verified key {} has no holders (possible data loss)",
                         hex::encode(key)
                     );
-                    q.remove_pending(key);
+                    q.remove_pending(&key);
                 } else {
-                    // Paid-only pipeline complete.
-                    q.remove_pending(key);
+                    q.remove_pending(&key);
                 }
             }
             KeyVerificationOutcome::QuorumFailed | KeyVerificationOutcome::QuorumInconclusive => {
-                q.remove_pending(key);
+                q.remove_pending(&key);
             }
         }
     }
@@ -1544,6 +1557,7 @@ struct FetchOutcome {
     result: FetchResult,
 }
 
+#[allow(clippy::too_many_lines)]
 /// Execute a single fetch request against `source` for `key`.
 ///
 /// Handles encoding, network I/O, integrity checking, storage, and trust
@@ -1590,6 +1604,28 @@ async fn execute_single_fetch(
                     data,
                 }) = resp_msg.body
                 {
+                    // Validate the response key matches the requested key.
+                    // A malicious peer could serve valid data for a different
+                    // key, passing integrity checks while the requested key
+                    // is falsely marked as fetched.
+                    if resp_key != key {
+                        warn!(
+                            "Fetch response key mismatch: requested {}, got {}",
+                            hex::encode(key),
+                            hex::encode(resp_key)
+                        );
+                        p2p_node
+                            .report_trust_event(
+                                &source,
+                                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                            )
+                            .await;
+                        return FetchOutcome {
+                            key,
+                            result: FetchResult::IntegrityFailed,
+                        };
+                    }
+
                     // Content-address integrity check.
                     let computed = crate::client::compute_address(&data);
                     if computed != resp_key {

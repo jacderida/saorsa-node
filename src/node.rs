@@ -702,6 +702,12 @@ impl RunningNode {
             );
         }
 
+        // Shutdown replication engine before P2P so background tasks don't
+        // use a dead P2P layer, and Arc<LmdbStorage> references are released.
+        if let Some(ref mut engine) = self.replication_engine {
+            engine.shutdown().await;
+        }
+
         // Stop protocol routing task
         if let Some(handle) = self.protocol_task.take() {
             handle.abort();

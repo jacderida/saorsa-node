@@ -120,15 +120,18 @@ impl Eq for FetchCandidate {}
 
 impl PartialEq for FetchCandidate {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.distance == other.distance && self.key == other.key
     }
 }
 
 impl Ord for FetchCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering: smaller distance = higher priority (BinaryHeap is
-        // max-heap).
-        other.distance.cmp(&self.distance)
+        // max-heap).  Tie-break on key for consistency with PartialEq.
+        other
+            .distance
+            .cmp(&self.distance)
+            .then_with(|| self.key.cmp(&other.key))
     }
 }
 
@@ -392,7 +395,31 @@ mod tests {
     }
 
     #[test]
-    fn fetch_candidate_equal_distance_is_equal_ordering() {
+    fn fetch_candidate_same_distance_and_key_is_equal() {
+        let a = FetchCandidate {
+            key: [1u8; 32],
+            distance: [5u8; 32],
+            sources: vec![],
+            tried: HashSet::new(),
+        };
+
+        let b = FetchCandidate {
+            key: [1u8; 32],
+            distance: [5u8; 32],
+            sources: vec![],
+            tried: HashSet::new(),
+        };
+
+        assert_eq!(
+            a.cmp(&b),
+            Ordering::Equal,
+            "same distance + same key should yield Equal"
+        );
+        assert_eq!(a, b, "PartialEq must agree with Ord");
+    }
+
+    #[test]
+    fn fetch_candidate_same_distance_different_key_is_deterministic() {
         let a = FetchCandidate {
             key: [1u8; 32],
             distance: [5u8; 32],
@@ -407,11 +434,12 @@ mod tests {
             tried: HashSet::new(),
         };
 
-        assert_eq!(
+        assert_ne!(
             a.cmp(&b),
             Ordering::Equal,
-            "equal distances should yield Equal ordering"
+            "same distance + different key must not be Equal"
         );
+        assert_ne!(a, b, "PartialEq must agree with Ord");
     }
 
     // -- PeerSyncRecord ----------------------------------------------------
