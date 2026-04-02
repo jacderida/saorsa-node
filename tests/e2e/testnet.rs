@@ -1593,6 +1593,83 @@ impl TestNetwork {
         &self.config
     }
 
+    /// Add a new node to an already-running network.
+    ///
+    /// Creates, starts, and bootstraps a fresh node that joins the existing
+    /// network. The node's DHT is warmed up and its replication engine is
+    /// allowed to complete bootstrap before this method returns.
+    ///
+    /// Returns the index of the newly added node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if node creation, startup, or bootstrap fails.
+    pub async fn add_node(&mut self) -> Result<usize> {
+        let index = self.nodes.len();
+
+        let bootstrap_addrs: Vec<MultiAddr> = self
+            .nodes
+            .get(0..self.config.bootstrap_count)
+            .unwrap_or_default()
+            .iter()
+            .map(|n| MultiAddr::quic(SocketAddr::from((Ipv4Addr::LOCALHOST, n.port))))
+            .collect();
+
+        let node = self.create_node(index, false, bootstrap_addrs).await?;
+        self.start_node(node).await?;
+
+        // Warm the new node's DHT so it discovers existing peers.
+        const DHT_WARMUP_QUERIES: usize = 10;
+        if let Some(ref p2p) = self.nodes[index].p2p_node {
+            for _ in 0..DHT_WARMUP_QUERIES {
+                let mut addr = [0u8; 32];
+                rand::Rng::fill(&mut rand::thread_rng(), &mut addr);
+                let _ = p2p.dht().find_closest_nodes(&addr, 8).await;
+            }
+        }
+
+        // Also warm existing nodes' DHTs so they discover the new peer.
+        // Without this, existing nodes may not include the new node in
+        // close-group calculations and won't generate replica hints for it.
+        for i in 0..index {
+            if let Some(ref p2p) = self.nodes[i].p2p_node {
+                for _ in 0..DHT_WARMUP_QUERIES {
+                    let mut addr = [0u8; 32];
+                    rand::Rng::fill(&mut rand::thread_rng(), &mut addr);
+                    let _ = p2p.dht().find_closest_nodes(&addr, 8).await;
+                }
+            }
+        }
+
+        // Give DHT time to propagate discoveries bidirectionally.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Trigger an early neighbor sync on ALL nodes (existing + new) so
+        // they exchange hints without waiting for the regular 10-20 minute
+        // cadence.  The new node requests hints from its neighbors, and
+        // existing nodes push hints to the new peer.
+        for node in &self.nodes {
+            if let Some(ref engine) = node.replication_engine {
+                engine.trigger_neighbor_sync();
+            }
+        }
+
+        // Wait for replication bootstrap to complete so the node is fully
+        // operational (accepting audits, neighbor sync, etc.).
+        const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
+        if let Some(ref engine) = self.nodes[index].replication_engine {
+            if !engine.wait_for_bootstrap_complete(BOOTSTRAP_TIMEOUT).await {
+                return Err(TestnetError::Stabilization(format!(
+                    "New node {index} replication bootstrap did not complete within {}s",
+                    BOOTSTRAP_TIMEOUT.as_secs(),
+                )));
+            }
+        }
+
+        info!("New node {index} added and fully bootstrapped");
+        Ok(index)
+    }
+
     /// Shutdown a specific node by index.
     ///
     /// This simulates a node failure during testing. The node is gracefully shut down

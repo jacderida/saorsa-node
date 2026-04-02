@@ -254,6 +254,15 @@ impl ReplicationEngine {
         }
     }
 
+    /// Trigger an early neighbor sync round.
+    ///
+    /// Useful after topology changes (new nodes joining, network heal after
+    /// partition) when the caller wants replication to converge faster than
+    /// the regular 10-20 minute cadence.
+    pub fn trigger_neighbor_sync(&self) {
+        self.sync_trigger.notify_one();
+    }
+
     /// Execute fresh replication for a newly stored record.
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
         fresh::replicate_fresh(
@@ -1214,31 +1223,11 @@ async fn handle_neighbor_sync_request(
 ) -> Result<()> {
     let self_id = *p2p_node.peer_id();
 
-    // Bound incoming hint count using the same dynamic limit as audit challenges.
-    #[allow(clippy::cast_possible_truncation)]
-    let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
-    let max_hints = ReplicationConfig::max_incoming_audit_keys(stored_chunks);
-    let total_hints = request.replica_hints.len() + request.paid_hints.len();
-    if total_hints > max_hints {
-        warn!(
-            "Neighbor sync request from {source} rejected: {total_hints} hints exceeds limit of {max_hints}",
-        );
-        // Send an empty response so the peer is not left waiting until timeout.
-        send_replication_response(
-            source,
-            p2p_node,
-            request_id,
-            ReplicationMessageBody::NeighborSyncResponse(NeighborSyncResponse {
-                replica_hints: Vec::new(),
-                paid_hints: Vec::new(),
-                bootstrapping: is_bootstrapping,
-                rejected_keys: Vec::new(),
-            }),
-            rr_message_id,
-        )
-        .await;
-        return Ok(());
-    }
+    // No per-request hint count limit: the wire message size limit
+    // (MAX_REPLICATION_MESSAGE_SIZE) already caps the payload. Unlike audit
+    // challenges, sync hints don't drive expensive computation — they just
+    // enter the verification queue. A per-request limit here would break
+    // bootstrap replication for newly-joined nodes with 0 stored chunks.
 
     // Build response (outbound hints).
     let (response, sender_in_rt) = neighbor_sync::handle_sync_request(
@@ -1310,17 +1299,10 @@ async fn handle_verification_request(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    // Bound incoming key count using the same dynamic limit as audit challenges.
-    #[allow(clippy::cast_possible_truncation)]
-    let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
-    let max_keys = ReplicationConfig::max_incoming_audit_keys(stored_chunks);
-    if request.keys.len() > max_keys {
-        warn!(
-            "Verification request from {source} rejected: {} keys exceeds limit of {max_keys}",
-            request.keys.len(),
-        );
-        return Ok(());
-    }
+    // No per-request key count limit: the wire message size limit
+    // (MAX_REPLICATION_MESSAGE_SIZE) already caps the payload. Verification
+    // does cheap storage lookups per key, not expensive computation like
+    // audit digest generation.
 
     #[allow(clippy::cast_possible_truncation)]
     let keys_len = request.keys.len() as u32;

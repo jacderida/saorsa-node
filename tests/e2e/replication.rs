@@ -1424,3 +1424,181 @@ async fn scenario_45_unrecoverable_when_paid_list_lost() {
 
     harness.teardown().await.expect("teardown");
 }
+
+// =========================================================================
+// Late-joiner bootstrap replication
+// =========================================================================
+
+/// A new node joining an existing network replicates all chunks it is
+/// responsible for during bootstrap.
+///
+/// This is the critical "late joiner" scenario: the network already holds
+/// data, a fresh node appears, and the replication subsystem must ensure
+/// the new node converges to hold every chunk whose close group includes
+/// it.
+///
+/// Flow:
+/// 1. Start a 5-node network and warm up DHT.
+/// 2. Store several chunks on existing nodes, pre-populate payment caches.
+/// 3. Trigger fresh replication so chunks spread across close groups.
+/// 4. Add a 6th node via `add_node()` (starts, bootstraps, replication
+///    engine finishes bootstrap).
+/// 5. Allow time for neighbor-sync and fetch workers to propagate chunks.
+/// 6. For each chunk whose close group (according to the new node's DHT)
+///    includes the new node, verify the chunk exists in the new node's
+///    storage.
+#[tokio::test]
+#[serial]
+async fn test_late_joiner_replicates_responsible_chunks() {
+    let mut harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    // ------------------------------------------------------------------
+    // Step 1: Store chunks on the existing 5-node network
+    // ------------------------------------------------------------------
+    let chunk_count = 10;
+    let mut chunks: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(chunk_count);
+
+    for i in 0..chunk_count {
+        let content = format!("late-joiner-test-chunk-{i}").into_bytes();
+        let address = compute_address(&content);
+        chunks.push((address, content));
+    }
+
+    // Store each chunk on node 2 and pre-populate payment caches on ALL
+    // existing nodes so fresh replication offers are accepted.
+    let source_idx = 2;
+    {
+        let source = harness.test_node(source_idx).expect("source node");
+        let storage = source.ant_protocol.as_ref().expect("protocol").storage();
+        for (address, content) in &chunks {
+            storage.put(address, content).await.expect("put");
+        }
+    }
+
+    for (address, _) in &chunks {
+        for i in 0..harness.node_count() {
+            if let Some(node) = harness.test_node(i) {
+                if let Some(protocol) = &node.ant_protocol {
+                    protocol.payment_verifier().cache_insert(*address);
+                }
+            }
+        }
+    }
+
+    // Trigger fresh replication for each chunk so they spread to close groups.
+    let dummy_pop = [0x01u8; 64];
+    {
+        let source = harness.test_node(source_idx).expect("source node");
+        if let Some(ref engine) = source.replication_engine {
+            for (address, content) in &chunks {
+                engine.replicate_fresh(address, content, &dummy_pop).await;
+            }
+        }
+    }
+
+    // Wait for replication to settle across the existing network.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // ------------------------------------------------------------------
+    // Step 2: Add a new (6th) node
+    // ------------------------------------------------------------------
+    let new_idx = harness.add_node().await.expect("add_node");
+
+    // Pre-populate payment caches on the new node so it accepts fetched chunks.
+    {
+        let new_node = harness.test_node(new_idx).expect("new node");
+        let protocol = new_node.ant_protocol.as_ref().expect("protocol");
+        for (address, _) in &chunks {
+            protocol.payment_verifier().cache_insert(*address);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Step 3: Wait for replication to propagate to the new node
+    // ------------------------------------------------------------------
+    // The replication subsystem discovers missing chunks via neighbor-sync
+    // and fetches them. Give it time to complete.
+    const REPLICATION_SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
+    const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+    let new_node = harness.test_node(new_idx).expect("new node");
+    let new_p2p = new_node.p2p_node.as_ref().expect("p2p");
+    let new_peer_id = *new_p2p.peer_id();
+    let new_storage = new_node.ant_protocol.as_ref().expect("protocol").storage();
+    let close_group_size = ant_node::replication::config::CLOSE_GROUP_SIZE;
+
+    // Determine which chunks the new node should be responsible for.
+    let mut responsible_chunks: Vec<[u8; 32]> = Vec::new();
+    for (address, _) in &chunks {
+        let closest = new_p2p
+            .dht_manager()
+            .find_closest_nodes_local_with_self(address, close_group_size)
+            .await;
+        if closest.iter().any(|n| n.peer_id == new_peer_id) {
+            responsible_chunks.push(*address);
+        }
+    }
+
+    // The new node should be responsible for at least some chunks in a
+    // 6-node network with CLOSE_GROUP_SIZE=7 (it should be responsible
+    // for all of them since 6 < 7, but be defensive).
+    assert!(
+        !responsible_chunks.is_empty(),
+        "New node should be in the close group for at least some chunks"
+    );
+
+    // Poll until all responsible chunks are present in the new node's storage.
+    let deadline = tokio::time::Instant::now() + REPLICATION_SETTLE_TIMEOUT;
+    let mut all_present = false;
+    while tokio::time::Instant::now() < deadline {
+        let mut count = 0;
+        for address in &responsible_chunks {
+            if new_storage.exists(address).unwrap_or(false) {
+                count += 1;
+            }
+        }
+        if count == responsible_chunks.len() {
+            all_present = true;
+            break;
+        }
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+    }
+
+    // ------------------------------------------------------------------
+    // Step 4: Verify
+    // ------------------------------------------------------------------
+    if !all_present {
+        let mut missing = Vec::new();
+        for address in &responsible_chunks {
+            if !new_storage.exists(address).unwrap_or(false) {
+                missing.push(hex::encode(address));
+            }
+        }
+        panic!(
+            "New node is missing {}/{} responsible chunks after {REPLICATION_SETTLE_TIMEOUT:?}: [{}]",
+            missing.len(),
+            responsible_chunks.len(),
+            missing.join(", "),
+        );
+    }
+
+    // Verify the data content is correct, not just presence.
+    for (address, content) in &chunks {
+        if responsible_chunks.contains(address) {
+            let stored = new_storage
+                .get(address)
+                .await
+                .expect("get should succeed")
+                .expect("chunk should exist");
+            assert_eq!(
+                &stored,
+                content,
+                "Stored chunk content should match original for key {}",
+                hex::encode(address),
+            );
+        }
+    }
+
+    harness.teardown().await.expect("teardown");
+}
