@@ -1653,14 +1653,6 @@ async fn execute_single_fetch(
                         );
                     }
 
-                    // Successful fetch — emit trust success (Section 14, rule 4).
-                    p2p_node
-                        .report_trust_event(
-                            &source,
-                            TrustEvent::ApplicationSuccess(REPLICATION_TRUST_WEIGHT),
-                        )
-                        .await;
-
                     return FetchOutcome {
                         key,
                         result: FetchResult::Stored,
@@ -1712,6 +1704,12 @@ async fn handle_audit_result(
             keys_checked,
         } => {
             debug!("Audit passed for {challenged_peer} ({keys_checked} keys)");
+            p2p_node
+                .report_trust_event(
+                    challenged_peer,
+                    TrustEvent::ApplicationSuccess(REPLICATION_TRUST_WEIGHT),
+                )
+                .await;
         }
         AuditTickResult::Failed { evidence } => {
             if let FailureEvidence::AuditFailure {
