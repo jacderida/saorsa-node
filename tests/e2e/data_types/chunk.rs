@@ -434,9 +434,7 @@ mod tests {
 
         let storage = LmdbStorage::new(LmdbStorageConfig {
             root_dir: temp_dir.clone(),
-            verify_on_read: true,
-            max_chunks: 0,
-            max_map_size: 0,
+            ..LmdbStorageConfig::test_default()
         })
         .await?;
 
@@ -446,7 +444,7 @@ mod tests {
             cache_capacity: 100,
             local_rewards_address: rewards_address,
         });
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
+        let metrics_tracker = QuotingMetricsTracker::new(100);
         let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         let protocol = AntProtocol::new(

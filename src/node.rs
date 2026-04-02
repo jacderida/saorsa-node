@@ -1,6 +1,6 @@
 //! Node implementation - thin wrapper around saorsa-core's `P2PNode`.
 
-use crate::ant_protocol::{CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE};
+use crate::ant_protocol::CHUNK_PROTOCOL_ID;
 use crate::config::{
     default_nodes_dir, default_root_dir, EvmNetworkConfig, NetworkMode, NodeConfig,
     NODE_IDENTITY_FILENAME,
@@ -12,6 +12,7 @@ use crate::payment::wallet::parse_rewards_address;
 use crate::payment::{EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
 use crate::replication::config::ReplicationConfig;
 use crate::replication::ReplicationEngine;
+use crate::storage::lmdb::MIB;
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{
     upgrade_cache_dir, AutoApplyUpgrader, BinaryCache, ReleaseCache, UpgradeMonitor, UpgradeResult,
@@ -31,14 +32,6 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-
-/// Node storage capacity limit (5 GB).
-///
-/// Used to derive `max_records` for the quoting metrics pricing curve.
-/// A node advertises `NODE_STORAGE_LIMIT_BYTES / MAX_CHUNK_SIZE` as
-/// its maximum record count, giving the pricing algorithm a meaningful
-/// fullness ratio instead of a hardcoded constant.
-pub const NODE_STORAGE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -364,8 +357,8 @@ impl NodeBuilder {
         let storage_config = LmdbStorageConfig {
             root_dir: config.root_dir.clone(),
             verify_on_read: config.storage.verify_on_read,
-            max_chunks: config.storage.max_chunks,
-            max_map_size: config.storage.db_size_gb.saturating_mul(1_073_741_824),
+            max_map_size: config.storage.db_size_gb.saturating_mul(1024 * 1024 * 1024),
+            disk_reserve: config.storage.disk_reserve_mb.saturating_mul(MIB),
         };
         let storage = LmdbStorage::new(storage_config)
             .await
@@ -394,10 +387,7 @@ impl NodeBuilder {
             local_rewards_address: rewards_address,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
-        // Safe: 5GB fits in usize on all supported 64-bit platforms.
-        #[allow(clippy::cast_possible_truncation)]
-        let max_records = (NODE_STORAGE_LIMIT_BYTES as usize) / MAX_CHUNK_SIZE;
-        let metrics_tracker = QuotingMetricsTracker::new(max_records, 0);
+        let metrics_tracker = QuotingMetricsTracker::new(0);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing from node identity.

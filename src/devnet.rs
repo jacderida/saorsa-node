@@ -79,9 +79,6 @@ const DEVNET_PAYMENT_CACHE_CAPACITY: usize = 1000;
 /// Devnet rewards address (20 bytes, all 0x01).
 const DEVNET_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 
-/// Max records for quoting metrics (devnet value).
-const DEVNET_MAX_RECORDS: usize = 100_000;
-
 /// Initial records for quoting metrics (devnet value).
 const DEVNET_INITIAL_RECORDS: usize = 1000;
 
@@ -244,11 +241,8 @@ pub struct DevnetEvmInfo {
     pub wallet_private_key: String,
     /// Payment token contract address.
     pub payment_token_address: String,
-    /// Data payments contract address.
-    pub data_payments_address: String,
-    /// Merkle payments contract address (for batch payments).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub merkle_payments_address: Option<String>,
+    /// Unified payment vault contract address (handles both single-node and merkle payments).
+    pub payment_vault_address: String,
 }
 
 /// Network state for devnet startup lifecycle.
@@ -569,8 +563,7 @@ impl Devnet {
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
-            max_chunks: 0,
-            max_map_size: 0,
+            ..LmdbStorageConfig::default()
         };
         let storage = LmdbStorage::new(storage_config)
             .await
@@ -590,8 +583,7 @@ impl Devnet {
             local_rewards_address: rewards_address,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
-        let metrics_tracker =
-            QuotingMetricsTracker::new(DEVNET_MAX_RECORDS, DEVNET_INITIAL_RECORDS);
+        let metrics_tracker = QuotingMetricsTracker::new(DEVNET_INITIAL_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing from the devnet node's identity

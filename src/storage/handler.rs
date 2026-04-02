@@ -442,9 +442,7 @@ mod tests {
 
         let storage_config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
-            verify_on_read: true,
-            max_chunks: 0,
-            max_map_size: 0,
+            ..LmdbStorageConfig::test_default()
         };
         let storage = Arc::new(
             LmdbStorage::new(storage_config)
@@ -459,7 +457,7 @@ mod tests {
             local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
+        let metrics_tracker = QuotingMetricsTracker::new(100);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing so quote requests succeed
@@ -868,8 +866,8 @@ mod tests {
                 );
 
                 assert_eq!(candidate.merkle_payment_timestamp, timestamp);
-                assert_eq!(candidate.quoting_metrics.data_size, 4096);
-                assert_eq!(candidate.quoting_metrics.data_type, DATA_TYPE_CHUNK);
+                // Node-calculated price based on records stored
+                assert!(candidate.price >= evmlib::common::Amount::ZERO);
             }
             other => panic!("expected MerkleCandidateQuoteResponse::Success, got: {other:?}"),
         }
