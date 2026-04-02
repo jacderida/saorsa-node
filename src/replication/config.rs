@@ -99,7 +99,7 @@ pub const AUDIT_TICK_INTERVAL_MAX: Duration = Duration::from_secs(AUDIT_TICK_INT
 /// Base audit response deadline (independent of challenge size).
 const AUDIT_RESPONSE_BASE_SECS: u64 = 6;
 /// Per-chunk allowance added to the base audit response deadline.
-const AUDIT_RESPONSE_PER_CHUNK_MS: u64 = 1;
+const AUDIT_RESPONSE_PER_CHUNK_MS: u64 = 10;
 
 /// Maximum duration a peer may claim bootstrap status before penalties apply.
 const BOOTSTRAP_CLAIM_GRACE_PERIOD_SECS: u64 = 24 * 60 * 60; // 24 h
