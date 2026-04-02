@@ -96,10 +96,10 @@ pub const AUDIT_TICK_INTERVAL_MIN: Duration = Duration::from_secs(AUDIT_TICK_INT
 /// Audit scheduler cadence range (max).
 pub const AUDIT_TICK_INTERVAL_MAX: Duration = Duration::from_secs(AUDIT_TICK_INTERVAL_MAX_SECS);
 
-/// Audit response deadline.
-const AUDIT_RESPONSE_TIMEOUT_SECS: u64 = 12;
-/// Audit response deadline.
-pub const AUDIT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(AUDIT_RESPONSE_TIMEOUT_SECS);
+/// Base audit response deadline (independent of challenge size).
+const AUDIT_RESPONSE_BASE_SECS: u64 = 6;
+/// Per-chunk allowance added to the base audit response deadline.
+const AUDIT_RESPONSE_PER_CHUNK_MS: u64 = 1;
 
 /// Maximum duration a peer may claim bootstrap status before penalties apply.
 const BOOTSTRAP_CLAIM_GRACE_PERIOD_SECS: u64 = 24 * 60 * 60; // 24 h
@@ -183,8 +183,10 @@ pub struct ReplicationConfig {
     pub audit_tick_interval_min: Duration,
     /// Audit scheduler cadence range (max).
     pub audit_tick_interval_max: Duration,
-    /// Audit response deadline.
-    pub audit_response_timeout: Duration,
+    /// Base audit response deadline (chunk-independent component).
+    pub audit_response_base: Duration,
+    /// Per-chunk allowance added to the base audit response deadline.
+    pub audit_response_per_chunk: Duration,
     /// Maximum duration a peer may claim bootstrap status.
     pub bootstrap_claim_grace_period: Duration,
     /// Minimum continuous out-of-range duration before pruning a key.
@@ -213,7 +215,8 @@ impl Default for ReplicationConfig {
             self_lookup_interval_max: SELF_LOOKUP_INTERVAL_MAX,
             audit_tick_interval_min: AUDIT_TICK_INTERVAL_MIN,
             audit_tick_interval_max: AUDIT_TICK_INTERVAL_MAX,
-            audit_response_timeout: AUDIT_RESPONSE_TIMEOUT,
+            audit_response_base: Duration::from_secs(AUDIT_RESPONSE_BASE_SECS),
+            audit_response_per_chunk: Duration::from_millis(AUDIT_RESPONSE_PER_CHUNK_MS),
             bootstrap_claim_grace_period: BOOTSTRAP_CLAIM_GRACE_PERIOD,
             prune_hysteresis_duration: PRUNE_HYSTERESIS_DURATION,
             verification_request_timeout: VERIFICATION_REQUEST_TIMEOUT,
@@ -310,6 +313,16 @@ impl ReplicationConfig {
         )]
         let sqrt = (total_keys as f64).sqrt() as usize;
         sqrt.max(1).min(total_keys)
+    }
+
+    /// Compute the audit response timeout for a challenge with `chunk_count`
+    /// keys: `base + per_chunk * chunk_count`.
+    #[must_use]
+    pub fn audit_response_timeout(&self, chunk_count: usize) -> Duration {
+        #[allow(clippy::cast_possible_truncation)]
+        // chunk_count is bounded by MAX_AUDIT_CHALLENGE_KEYS (5_000).
+        let chunks = chunk_count as u32;
+        self.audit_response_base + self.audit_response_per_chunk * chunks
     }
 
     /// Returns a random duration in `[audit_tick_interval_min,

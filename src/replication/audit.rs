@@ -157,7 +157,7 @@ pub async fn audit_tick(
             &challenged_peer,
             REPLICATION_PROTOCOL_ID,
             encoded,
-            config.audit_response_timeout,
+            config.audit_response_timeout(peer_keys.len()),
         )
         .await
     {
