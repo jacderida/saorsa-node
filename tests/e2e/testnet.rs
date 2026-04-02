@@ -1227,12 +1227,14 @@ impl TestNetwork {
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
             let shutdown = CancellationToken::new();
             let repl_config = ReplicationConfig::default();
+            let (_fresh_tx, fresh_rx) = tokio::sync::mpsc::unbounded_channel();
             match ReplicationEngine::new(
                 repl_config,
                 Arc::clone(p2p),
                 protocol.storage(),
                 protocol.payment_verifier_arc(),
                 &node.data_dir,
+                fresh_rx,
                 shutdown.clone(),
             )
             .await

@@ -36,9 +36,11 @@ use crate::ant_protocol::{
 use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, QuoteGenerator};
+use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// ANT protocol handler.
@@ -53,6 +55,8 @@ pub struct AntProtocol {
     /// Quote generator for creating storage quotes.
     /// Also handles merkle candidate quote signing via ML-DSA-65.
     quote_generator: Arc<QuoteGenerator>,
+    /// Channel for notifying the replication engine about newly-stored chunks.
+    fresh_write_tx: Option<mpsc::UnboundedSender<FreshWriteEvent>>,
 }
 
 impl AntProtocol {
@@ -73,7 +77,16 @@ impl AntProtocol {
             storage,
             payment_verifier,
             quote_generator,
+            fresh_write_tx: None,
         }
+    }
+
+    /// Set the channel sender for fresh-write replication events.
+    ///
+    /// When set, successful chunk PUTs will notify the replication engine
+    /// so it can fan out fresh offers to the close group.
+    pub fn set_fresh_write_sender(&mut self, tx: mpsc::UnboundedSender<FreshWriteEvent>) {
+        self.fresh_write_tx = Some(tx);
     }
 
     /// Get the protocol identifier.
@@ -211,6 +224,19 @@ impl AntProtocol {
                 // Record the store and payment in metrics
                 self.quote_generator.record_store(DATA_TYPE_CHUNK);
                 self.quote_generator.record_payment();
+
+                // 6. Notify replication engine for fresh fan-out.
+                if let Some(ref tx) = self.fresh_write_tx {
+                    let event = FreshWriteEvent {
+                        key: address,
+                        data: request.content,
+                        payment_proof: request.payment_proof.unwrap_or_default(),
+                    };
+                    if tx.send(event).is_err() {
+                        debug!("Fresh-write channel closed, skipping replication for {addr_hex}");
+                    }
+                }
+
                 ChunkPutResponse::Success { address }
             }
             Err(e) => {

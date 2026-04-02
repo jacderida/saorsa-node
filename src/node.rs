@@ -125,42 +125,46 @@ impl NodeBuilder {
             None
         };
 
-        // Initialize ANT protocol handler for chunk storage
-        let ant_protocol = if self.config.storage.enabled {
-            Some(Arc::new(
-                Self::build_ant_protocol(&self.config, &identity).await?,
-            ))
+        // Initialize ANT protocol handler for chunk storage and
+        // wire the fresh-write channel so PUTs trigger replication.
+        let (ant_protocol, fresh_write_rx) = if self.config.storage.enabled {
+            let (fresh_write_tx, fresh_write_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut protocol = Self::build_ant_protocol(&self.config, &identity).await?;
+            protocol.set_fresh_write_sender(fresh_write_tx);
+            (Some(Arc::new(protocol)), Some(fresh_write_rx))
         } else {
             info!("Chunk storage disabled");
-            None
+            (None, None)
         };
 
         let p2p_arc = Arc::new(p2p_node);
 
         // Initialize replication engine (if storage is enabled)
-        let replication_engine = if let Some(ref protocol) = ant_protocol {
-            let repl_config = ReplicationConfig::default();
-            let storage_arc = protocol.storage();
-            let payment_verifier_arc = protocol.payment_verifier_arc();
-            match ReplicationEngine::new(
-                repl_config,
-                Arc::clone(&p2p_arc),
-                storage_arc,
-                payment_verifier_arc,
-                &self.config.root_dir,
-                shutdown.clone(),
-            )
-            .await
-            {
-                Ok(engine) => Some(engine),
-                Err(e) => {
-                    warn!("Failed to initialize replication engine: {e}");
-                    None
+        let replication_engine =
+            if let (Some(ref protocol), Some(fresh_rx)) = (&ant_protocol, fresh_write_rx) {
+                let repl_config = ReplicationConfig::default();
+                let storage_arc = protocol.storage();
+                let payment_verifier_arc = protocol.payment_verifier_arc();
+                match ReplicationEngine::new(
+                    repl_config,
+                    Arc::clone(&p2p_arc),
+                    storage_arc,
+                    payment_verifier_arc,
+                    &self.config.root_dir,
+                    fresh_rx,
+                    shutdown.clone(),
+                )
+                .await
+                {
+                    Ok(engine) => Some(engine),
+                    Err(e) => {
+                        warn!("Failed to initialize replication engine: {e}");
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         let node = RunningNode {
             config: self.config,

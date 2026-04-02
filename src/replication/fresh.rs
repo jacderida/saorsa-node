@@ -19,6 +19,20 @@ use crate::replication::protocol::{
     FreshReplicationOffer, PaidNotify, ReplicationMessage, ReplicationMessageBody,
 };
 
+/// A newly-stored chunk that needs fresh replication.
+///
+/// Sent from the chunk PUT handler to the replication engine via an
+/// unbounded channel so that the PUT response is not blocked by
+/// replication fan-out.
+pub struct FreshWriteEvent {
+    /// Content-address of the stored chunk.
+    pub key: XorName,
+    /// The chunk data.
+    pub data: Vec<u8>,
+    /// Serialized proof-of-payment.
+    pub payment_proof: Vec<u8>,
+}
+
 /// Execute fresh replication for a newly accepted record.
 ///
 /// Sends fresh offers to close group members and `PaidNotify` to

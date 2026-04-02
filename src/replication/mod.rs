@@ -37,7 +37,7 @@ use std::pin::Pin;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use rand::Rng;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -120,6 +120,11 @@ pub struct ReplicationEngine {
     is_bootstrapping: Arc<RwLock<bool>>,
     /// Trigger for early neighbor sync (signalled on topology changes).
     sync_trigger: Arc<Notify>,
+    /// Receiver for fresh-write events from the chunk PUT handler.
+    ///
+    /// When present, `start()` spawns a drainer task that calls
+    /// `replicate_fresh` for each event.
+    fresh_write_rx: Option<mpsc::UnboundedReceiver<fresh::FreshWriteEvent>>,
     /// Shutdown token.
     shutdown: CancellationToken,
     /// Background task handles.
@@ -139,6 +144,7 @@ impl ReplicationEngine {
         storage: Arc<LmdbStorage>,
         payment_verifier: Arc<PaymentVerifier>,
         root_dir: &Path,
+        fresh_write_rx: mpsc::UnboundedReceiver<fresh::FreshWriteEvent>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         config.validate().map_err(Error::Config)?;
@@ -164,6 +170,7 @@ impl ReplicationEngine {
             bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
             is_bootstrapping: Arc::new(RwLock::new(true)),
             sync_trigger: Arc::new(Notify::new()),
+            fresh_write_rx: Some(fresh_write_rx),
             shutdown,
             task_handles: Vec::new(),
         })
@@ -194,6 +201,7 @@ impl ReplicationEngine {
         self.start_fetch_worker();
         self.start_verification_worker();
         self.start_bootstrap_sync(dht_events);
+        self.start_fresh_write_drainer();
 
         info!(
             "Replication engine started with {} background tasks",
@@ -230,6 +238,40 @@ impl ReplicationEngine {
     // Background task launchers
     // =======================================================================
 
+    /// Spawn a task that drains the fresh-write channel and triggers
+    /// replication for each newly-stored chunk.
+    fn start_fresh_write_drainer(&mut self) {
+        let Some(mut rx) = self.fresh_write_rx.take() else {
+            return;
+        };
+        let p2p = Arc::clone(&self.p2p_node);
+        let paid_list = Arc::clone(&self.paid_list);
+        let config = Arc::clone(&self.config);
+        let shutdown = self.shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    event = rx.recv() => {
+                        let Some(event) = event else { break };
+                        fresh::replicate_fresh(
+                            &event.key,
+                            &event.data,
+                            &event.payment_proof,
+                            &p2p,
+                            &paid_list,
+                            &config,
+                        )
+                        .await;
+                    }
+                }
+            }
+            debug!("Fresh-write drainer shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
     #[allow(clippy::too_many_lines)]
     fn start_message_handler(&mut self) {
         let mut p2p_events = self.p2p_node.subscribe_events();
@@ -242,6 +284,7 @@ impl ReplicationEngine {
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let sync_history = Arc::clone(&self.sync_history);
         let sync_trigger = Arc::clone(&self.sync_trigger);
 
@@ -281,6 +324,7 @@ impl ReplicationEngine {
                                     &queues,
                                     &config,
                                     &is_bootstrapping,
+                                    &bootstrap_state,
                                     &sync_history,
                                     rr_message_id.as_deref(),
                                 ).await {
@@ -327,6 +371,7 @@ impl ReplicationEngine {
         let sync_state = Arc::clone(&self.sync_state);
         let sync_history = Arc::clone(&self.sync_history);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let sync_trigger = Arc::clone(&self.sync_trigger);
 
         let handle = tokio::spawn(async move {
@@ -348,6 +393,7 @@ impl ReplicationEngine {
                     &sync_state,
                     &sync_history,
                     &is_bootstrapping,
+                    &bootstrap_state,
                 )
                 .await;
             }
@@ -782,6 +828,7 @@ async fn handle_replication_message(
     queues: &Arc<RwLock<ReplicationQueues>>,
     config: &ReplicationConfig,
     is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
@@ -825,6 +872,7 @@ async fn handle_replication_message(
                 queues,
                 config,
                 bootstrapping,
+                bootstrap_state,
                 sync_history,
                 msg.request_id,
                 rr_message_id,
@@ -903,6 +951,40 @@ async fn handle_fresh_offer(
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
                 key: offer.key,
                 reason: "Missing proof of payment".to_string(),
+            }),
+            rr_message_id,
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Enforce chunk size invariant: the normal PUT path rejects data larger
+    // than MAX_CHUNK_SIZE; the replication receive path must do the same to
+    // prevent peers from pushing oversized records through replication.
+    if offer.data.len() > crate::ant_protocol::MAX_CHUNK_SIZE {
+        warn!(
+            "Rejecting fresh offer for key {}: data size {} exceeds MAX_CHUNK_SIZE {}",
+            hex::encode(offer.key),
+            offer.data.len(),
+            crate::ant_protocol::MAX_CHUNK_SIZE,
+        );
+        p2p_node
+            .report_trust_event(
+                source,
+                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+            )
+            .await;
+        send_replication_response(
+            source,
+            p2p_node,
+            request_id,
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+                key: offer.key,
+                reason: format!(
+                    "Data size {} exceeds maximum chunk size {}",
+                    offer.data.len(),
+                    crate::ant_protocol::MAX_CHUNK_SIZE,
+                ),
             }),
             rr_message_id,
         )
@@ -1085,6 +1167,7 @@ async fn handle_neighbor_sync_request(
     queues: &Arc<RwLock<ReplicationQueues>>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     request_id: u64,
     rr_message_id: Option<&str>,
@@ -1156,7 +1239,7 @@ async fn handle_neighbor_sync_request(
     }
 
     // Admit inbound hints and queue for verification.
-    admit_and_queue_hints(
+    let admitted_keys = admit_and_queue_hints(
         &self_id,
         source,
         &request.replica_hints,
@@ -1168,6 +1251,12 @@ async fn handle_neighbor_sync_request(
         queues,
     )
     .await;
+
+    // Track discovered keys for bootstrap drain detection so that
+    // hints admitted via inbound sync requests are not missed.
+    if is_bootstrapping && !admitted_keys.is_empty() {
+        bootstrap::track_discovered_keys(bootstrap_state, &admitted_keys).await;
+    }
 
     Ok(())
 }
@@ -1357,6 +1446,7 @@ async fn run_neighbor_sync_round(
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -1431,6 +1521,8 @@ async fn run_neighbor_sync_round(
                 &resp,
                 p2p_node,
                 config,
+                bootstrapping,
+                bootstrap_state,
                 storage,
                 paid_list,
                 queues,
@@ -1464,6 +1556,8 @@ async fn run_neighbor_sync_round(
                         &resp,
                         p2p_node,
                         config,
+                        bootstrapping,
+                        bootstrap_state,
                         storage,
                         paid_list,
                         queues,
@@ -1486,6 +1580,8 @@ async fn handle_sync_response(
     resp: &NeighborSyncResponse,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
+    bootstrapping: bool,
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
     storage: &Arc<LmdbStorage>,
     paid_list: &Arc<PaidList>,
     queues: &Arc<RwLock<ReplicationQueues>>,
@@ -1542,7 +1638,7 @@ async fn handle_sync_response(
             let mut state = sync_state.write().await;
             state.bootstrap_claims.remove(peer);
         }
-        admit_and_queue_hints(
+        let admitted_keys = admit_and_queue_hints(
             self_id,
             peer,
             &resp.replica_hints,
@@ -1554,6 +1650,12 @@ async fn handle_sync_response(
             queues,
         )
         .await;
+
+        // Track discovered keys for bootstrap drain detection so that
+        // hints admitted via regular neighbor sync are not missed.
+        if bootstrapping && !admitted_keys.is_empty() {
+            bootstrap::track_discovered_keys(bootstrap_state, &admitted_keys).await;
+        }
     }
 }
 
@@ -1882,6 +1984,28 @@ async fn execute_single_fetch(
                             "Fetch response key mismatch: requested {}, got {}",
                             hex::encode(key),
                             hex::encode(resp_key)
+                        );
+                        p2p_node
+                            .report_trust_event(
+                                &source,
+                                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                            )
+                            .await;
+                        return FetchOutcome {
+                            key,
+                            result: FetchResult::IntegrityFailed,
+                        };
+                    }
+
+                    // Enforce chunk size invariant on fetched data.
+                    // Checked before the content-address hash to avoid
+                    // hashing up to 10 MiB of oversized junk data.
+                    if data.len() > crate::ant_protocol::MAX_CHUNK_SIZE {
+                        warn!(
+                            "Fetched record {} exceeds MAX_CHUNK_SIZE ({} > {})",
+                            hex::encode(resp_key),
+                            data.len(),
+                            crate::ant_protocol::MAX_CHUNK_SIZE,
                         );
                         p2p_node
                             .report_trust_event(
