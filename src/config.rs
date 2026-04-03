@@ -555,9 +555,9 @@ impl BootstrapPeersConfig {
                 match Self::from_file(&path) {
                     Ok(config) if !config.peers.is_empty() => return Some((config, path)),
                     Ok(_) => {}
-                    Err(_err) => {
+                    Err(err) => {
                         crate::logging::warn!(
-                            "Failed to load bootstrap peers from {}",
+                            "Failed to load bootstrap peers from {}: {err}",
                             path.display(),
                         );
                     }
