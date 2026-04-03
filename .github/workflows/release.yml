@@ -394,6 +394,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.validate.outputs.version }}
           name: Autonomi Node ${{ needs.validate.outputs.version }}
           body: |
             ## Autonomi Node ${{ needs.validate.outputs.version }}
