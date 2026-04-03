@@ -42,6 +42,8 @@
 pub mod ant_protocol;
 pub mod client;
 pub mod config;
+#[macro_use]
+pub mod logging;
 pub mod devnet;
 pub mod error;
 pub mod event;

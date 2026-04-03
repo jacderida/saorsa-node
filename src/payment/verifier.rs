@@ -5,6 +5,7 @@
 
 use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
+use crate::logging::{debug, info};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
@@ -22,7 +23,6 @@ use parking_lot::Mutex;
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
 use std::num::NonZeroUsize;
 use std::time::SystemTime;
-use tracing::{debug, info};
 
 /// Minimum allowed size for a payment proof in bytes.
 ///
@@ -162,14 +162,14 @@ impl PaymentVerifier {
     pub fn check_payment_required(&self, xorname: &XorName) -> PaymentStatus {
         // Check LRU cache (fast path)
         if self.cache.contains(xorname) {
-            if tracing::enabled!(tracing::Level::DEBUG) {
+            if crate::logging::enabled!(crate::logging::Level::DEBUG) {
                 debug!("Data {} found in verified cache", hex::encode(xorname));
             }
             return PaymentStatus::CachedAsVerified;
         }
 
         // Not in cache - payment required
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if crate::logging::enabled!(crate::logging::Level::DEBUG) {
             debug!(
                 "Data {} not in cache - payment required",
                 hex::encode(xorname)
@@ -305,7 +305,7 @@ impl PaymentVerifier {
     /// the cache so `verify_payment` returns `CachedAsVerified` before
     /// reaching this method.
     async fn verify_evm_payment(&self, xorname: &XorName, payment: &ProofOfPayment) -> Result<()> {
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if crate::logging::enabled!(crate::logging::Level::DEBUG) {
             let xorname_hex = hex::encode(xorname);
             let quote_count = payment.peer_quotes.len();
             debug!("Verifying EVM payment for {xorname_hex} with {quote_count} quotes");
@@ -357,7 +357,7 @@ impl PaymentVerifier {
                 ))
             })?;
 
-        if tracing::enabled!(tracing::Level::INFO) {
+        if crate::logging::enabled!(crate::logging::Level::INFO) {
             let xorname_hex = hex::encode(xorname);
             info!("EVM payment verified for {xorname_hex} (median paid {verified_amount} atto)");
         }
@@ -465,7 +465,7 @@ impl PaymentVerifier {
     /// 5. Cache the pool hash for subsequent chunk verifications in the same batch
     #[allow(clippy::too_many_lines)]
     async fn verify_merkle_payment(&self, xorname: &XorName, proof_bytes: &[u8]) -> Result<()> {
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if crate::logging::enabled!(crate::logging::Level::DEBUG) {
             debug!("Verifying merkle payment for {}", hex::encode(xorname));
         }
 
@@ -648,7 +648,7 @@ impl PaymentVerifier {
             }
         }
 
-        if tracing::enabled!(tracing::Level::INFO) {
+        if crate::logging::enabled!(crate::logging::Level::INFO) {
             info!(
                 "Merkle payment verified for {} (pool: {})",
                 hex::encode(xorname),

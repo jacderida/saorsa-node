@@ -35,13 +35,13 @@ use crate::ant_protocol::{
 };
 use crate::client::compute_address;
 use crate::error::{Error, Result};
+use crate::logging::{debug, info, warn};
 use crate::payment::{PaymentVerifier, QuoteGenerator};
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
 
 /// ANT protocol handler.
 ///
